@@ -463,7 +463,7 @@ with tabs[4]:
     name  = st.text_input("Nome",   key="prof_name")
     email = st.text_input("E-mail", key="prof_email")
     role  = st.selectbox("Papel", ["docente","admin"], key="prof_role")
-    pinp  = st.text_input("PIN", type="password", key="prof_pin")
+    pinp  = st.text_input("PIN", type="password", key="pin_professor")
 
     if st.button("Salvar docente"):
         exec_sql("""INSERT INTO professors(name,email,role,pin) VALUES(:n,:e,:r,:p)
