@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import datetime
+from modules.import_txt import parse_puc_txt, upsert_students_and_enroll
 
 st.set_page_config(page_title="Submissões – Industrial & EBC II (2º/2025)", layout="wide")
 
@@ -426,7 +427,7 @@ with tabs[4]:
     term = st.text_input("Semestre (term)", value="2025/2")
     up_txt = st.file_uploader("Arquivos .txt", type=["txt"], accept_multiple_files=True, key="txts")
     if up_txt and st.button("Processar TXT"):
-        from app.modules.import_txt import parse_puc_txt, upsert_students_and_enroll
+        from modules.import_txt import parse_puc_txt, upsert_students_and_enroll
         ok_count = 0
         temp_dir = pathlib.Path(DATA_DIR) / "_tmp"; temp_dir.mkdir(parents=True, exist_ok=True)
         disc_map = {"ECONOMIA INDUSTRIAL":"IND", "EBC II":"EBCII"}
