@@ -1,4 +1,6 @@
-import os, json, pathlib, re
+# topo do app.py
+import os
+import json, pathlib, re
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -458,10 +460,11 @@ with tabs[4]:
             st.error(str(e))
     st.markdown("---")
     st.subheader("Docentes (PIN)")
-    name = st.text_input("Nome")
-    email = st.text_input("E-mail")
-    role = st.selectbox("Papel", ["docente","admin"])
-    pinp = st.text_input("PIN", type="password")
+    name  = st.text_input("Nome",   key="prof_name")
+    email = st.text_input("E-mail", key="prof_email")
+    role  = st.selectbox("Papel", ["docente","admin"], key="prof_role")
+    pinp  = st.text_input("PIN", type="password", key="prof_pin")
+
     if st.button("Salvar docente"):
         exec_sql("""INSERT INTO professors(name,email,role,pin) VALUES(:n,:e,:r,:p)
                     ON CONFLICT(email) DO UPDATE SET name=:n, role=:r, pin=:p""", n=name,e=email,r=role,p=pinp)
