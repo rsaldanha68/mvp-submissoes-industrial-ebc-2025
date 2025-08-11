@@ -502,4 +502,4 @@ if st.session_state.get("user_type") == "teacher":
                         ON CONFLICT(email) DO UPDATE SET name=:n, role=:r, pin=:p""", n=name, e=email, r=role, p=pinp)
             st.success("Docente salvo/atualizado.")
 
-st.caption("MVP – Submissões Industrial & EBC II (2º/2025)")```
+st.caption("MVP – Submissões Industrial & EBC II (2º/2025)")
