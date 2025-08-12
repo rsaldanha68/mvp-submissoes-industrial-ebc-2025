@@ -1,11 +1,18 @@
-import os, json, pathlib, re
+import os, sys, json, pathlib, re
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import datetime
-import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parent))  # Ajuste para módulos internos
-from modules.import_txt import parse_puc_txt, upsert_students_and_enroll
+
+
+APP_ROOT = pathlib.Path(__file__).parent.resolve()
+PKG_ROOTS = [APP_ROOT, APP_ROOT / "app", APP_ROOT / "app" / "modules"]
+for p in map(str, PKG_ROOTS):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from app.modules.import_txt import parse_puc_txt, upsert_students_and_enroll
 
 st.set_page_config(page_title="Submissões – Industrial & EBC II (2º/2025)", layout="wide")
 
