@@ -12,7 +12,7 @@ for p in (APP_ROOT, APP_ROOT / "app", APP_ROOT / "app" / "modules"):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from app.modules.import_txt import parse_puc_txt, upsert_students_and_enroll
+from modules.import_txt import parse_puc_txt, upsert_students_and_enroll
 
 st.set_page_config(page_title="Submissões – Industrial & EBC II (2º/2025)", layout="wide")
 
