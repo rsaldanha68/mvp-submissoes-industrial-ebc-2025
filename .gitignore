@@ -1,0 +1,6 @@
+# DB local e artefatos
+data/*.db
+uploads/*
+public/*
+__pycache__/
+*.pyc
