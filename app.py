@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-import os, json, pathlib, re
-from datetime import datetime
+import os, sys, json, pathlib, re
+from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 
-# -----------------------------------------------------------------------------
+# =========================================================
 # CONFIG BÁSICA
-# -----------------------------------------------------------------------------
+# =========================================================
 st.set_page_config(page_title="Submissões – Industrial & EBC II (2º/2025)", layout="wide")
 
 # Pastas
@@ -21,17 +21,24 @@ for p in (DATA_DIR, UPLOAD_DIR, PUBLIC_DIR, "app", "app/modules"):
 DB_URL = f"sqlite:///{os.path.join(DATA_DIR, 'app.db')}"
 engine = create_engine(DB_URL, future=True)
 
-# Parâmetros operacionais (podem ir em st.secrets)
-TERM_ATUAL = st.secrets.get("TERM_ATUAL", "2025/2")
-# Até esta data (inclusive) exigir 5+ alunos para reservar tema.
-DEADLINE_MIN5 = st.secrets.get("DEADLINE_MIN5", "2025-10-15")
-# Depois da data limite, permitir a partir de:
-MIN_AFTER_DEADLINE = int(st.secrets.get("MIN_AFTER_DEADLINE", 3))
+# Parâmetros (podem vir de secrets)
+TERM_ATUAL          = st.secrets.get("TERM_ATUAL", "2025/2")
+DEADLINE_MIN5       = st.secrets.get("DEADLINE_MIN5", "2025-10-15")  # até essa data, min 5
+MIN_AFTER_DEADLINE  = int(st.secrets.get("MIN_AFTER_DEADLINE", 3))   # depois da data, min 3
+ADMIN_EMAIL         = st.secrets.get("ADMIN_EMAIL", "rsaldanha@pucsp.br")
+ADMIN_PIN           = st.secrets.get("ADMIN_PIN", "admin")
 
-# -----------------------------------------------------------------------------
-# BOOTSTRAP DO BANCO
-# -----------------------------------------------------------------------------
-def bootstrap_db():
+# Permitir importar app/modules (TXT parser opcional)
+APP_ROOT = pathlib.Path(__file__).parent.resolve()
+for p in (APP_ROOT, APP_ROOT / "app", APP_ROOT / "app" / "modules"):
+    s = str(p)
+    if s not in sys.path:
+        sys.path.insert(0, s)
+
+# =========================================================
+# MIGRAÇÃO (IDEMPOTENTE) E SEEDS
+# =========================================================
+def ensure_schema_and_migrate():
     with engine.begin() as conn:
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS groups(
@@ -129,35 +136,33 @@ def bootstrap_db():
           UNIQUE(student_id, offering_id)
         );""")
         conn.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS pending_users(
+        CREATE TABLE IF NOT EXISTS pending_students(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
-          kind TEXT,          -- 'aluno' | 'docente'
-          email TEXT,
-          created_at TEXT
+          name TEXT NOT NULL,
+          turma TEXT,
+          requester TEXT,
+          requested_at TEXT
         );""")
 
-        # seeds
+        # Seeds mínimos
         conn.execute(text("INSERT OR IGNORE INTO disciplines(code,name) VALUES('IND','Economia Industrial')"))
         conn.execute(text("INSERT OR IGNORE INTO disciplines(code,name) VALUES('EBCII','Economia Brasileira II')"))
         conn.execute(text("INSERT OR IGNORE INTO semesters(term) VALUES(:t)"), {"t": TERM_ATUAL})
 
-        # seed admin se não existir ninguém
-        profs = conn.execute(text("SELECT COUNT(*) FROM professors")).scalar_one()
-        if profs == 0:
-            # usa secrets se houver, senão padrão
-            admin_email = st.secrets.get("ADMIN_EMAIL", "rsaldanha@pucsp.br")
-            admin_pin   = st.secrets.get("ADMIN_PIN", "admin")
+        # Seed admin (caso vazio)
+        cnt = conn.execute(text("SELECT COUNT(*) FROM professors")).scalar() or 0
+        if cnt == 0:
             conn.execute(text("""
               INSERT INTO professors(name,email,role,pin)
               VALUES(:n,:e,'admin',:p)
               ON CONFLICT(email) DO NOTHING
-            """), {"n":"Administrador", "e":admin_email, "p":admin_pin})
+            """), {"n":"Administrador", "e":ADMIN_EMAIL, "p":ADMIN_PIN})
 
-bootstrap_db()
+ensure_schema_and_migrate()
 
-# -----------------------------------------------------------------------------
-# THEMES: carregar/atualizar do JSON (merge por título)
-# -----------------------------------------------------------------------------
+# =========================================================
+# THEMES (carregar JSON, merge por título)
+# =========================================================
 def ensure_themes_from_json(path_json: str) -> int:
     if not os.path.exists(path_json):
         return 0
@@ -168,24 +173,30 @@ def ensure_themes_from_json(path_json: str) -> int:
         existing = pd.read_sql("SELECT title FROM themes", conn)
         have = set(existing["title"].tolist()) if not existing.empty else set()
         for it in items:
-            title = (it.get("title") or "").strip()
+            if isinstance(it, str):
+                title = it.strip()
+                number = None
+                category = "Outro"
+            else:
+                title = (it.get("title") or "").strip()
+                number = it.get("number")
+                category = it.get("category") or "Outro"
             if not title or title in have:
                 continue
             conn.execute(text("""INSERT INTO themes(number,title,category,status)
-                               VALUES(:n,:t,:c,'livre')"""),
-                         {"n": int(it.get("number", 0) or 0),
-                          "t": title,
-                          "c": it.get("category", "Outro")})
+                                 VALUES(:n,:t,:c,'livre')"""),
+                         {"n": int(number) if number not in (None, "") else None,
+                          "t": title, "c": category})
             inserted += 1
     return inserted
 
-_added = ensure_themes_from_json(os.path.join("data", "themes_2025_2.json"))
+_added = ensure_themes_from_json(os.path.join("data","themes_2025_2.json"))
 if _added:
     st.sidebar.success(f"Temas carregados: +{_added}")
 
-# -----------------------------------------------------------------------------
+# =========================================================
 # HELPERS BD
-# -----------------------------------------------------------------------------
+# =========================================================
 def get_df(sql: str, **params):
     with engine.begin() as conn:
         return pd.read_sql(text(sql), conn, params=params)
@@ -208,6 +219,32 @@ def list_free_themes(category: str | None = None):
     else:
         df = get_df("SELECT title FROM themes WHERE status='livre' ORDER BY number")
     return df["title"].tolist()
+
+def _extract_turma_counts(nomes: list[str]) -> dict:
+    if not nomes:
+        return {}
+    # evita IN vazio
+    placeholders = ",".join([f":n{i}" for i in range(len(nomes))])
+    sql = f"SELECT name, turma FROM students WHERE name IN ({placeholders})"
+    params = {f"n{i}": nomes[i] for i in range(len(nomes))}
+    q = get_df(sql, **params)
+    return dict(q["turma"].value_counts()) if not q.empty else {}
+
+def turma_majoritaria(nomes: list[str], turma_fallback: str | None) -> str:
+    cont = _extract_turma_counts(nomes)
+    if not cont:
+        return turma_fallback or "MA6"
+    top = sorted(cont.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    return top
+
+def proximo_codigo_por_turma(turma: str) -> str:
+    df = get_df("SELECT code FROM groups WHERE turma=:t", t=turma)
+    max_n = 0
+    for c in df["code"].tolist():
+        m = re.search(rf"^{re.escape(turma)}G(\d+)$", c or "", re.I)
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    return f"{turma}G{max_n+1}"
 
 def reserve_theme(theme_title: str, group_code: str, min_required: int):
     members = group_details(group_code)
@@ -255,59 +292,48 @@ def link_student_to_group(student_id: int, group_code: str):
     name = srow["name"].iloc[0]
     exec_sql("INSERT OR IGNORE INTO group_members(group_id,student_name) VALUES(:g,:n)", g=gid, n=name)
 
-def turma_majoritaria(nomes: list[str], turma_fallback: str | None) -> str:
-    if not nomes and turma_fallback:
-        return turma_fallback
-    if not nomes:
-        return "MA6"
-    q = get_df("SELECT name, turma FROM students WHERE name IN :ns", ns=tuple(nomes))
-    cont = q["turma"].value_counts().to_dict() if not q.empty else {}
-    if not cont and turma_fallback:
-        return turma_fallback
-    if not cont:
-        return "MA6"
-    top = sorted(cont.items(), key=lambda kv: (-kv[1], kv[0]))
-    return top[0][0] if isinstance(top[0], str) else top[0][0]
-
-def proximo_codigo_por_turma(turma: str) -> str:
-    df = get_df("SELECT code FROM groups WHERE turma=:t", t=turma)
-    max_n = 0
-    for c in df["code"].tolist():
-        m = re.search(rf"^{re.escape(turma)}G(\d+)$", c or "", re.I)
-        if m:
-            max_n = max(max_n, int(m.group(1)))
-    return f"{turma}G{max_n+1}"
-
-# -----------------------------------------------------------------------------
-# LOGIN / SESSÃO
-# -----------------------------------------------------------------------------
+# =========================================================
+# LOGIN
+# =========================================================
 def login_ui():
-    st.header("Login")
-    role = st.radio("Sou:", ["Aluno", "Docente"], index=1, horizontal=True)
-    email = st.text_input("E-mail institucional")
-    pin = st.text_input("PIN", type="password") if role == "Docente" else None
+    st.title("Submissões – Industrial & EBC II (2º/2025)")
+    st.subheader("Login")
+    role = st.radio("Sou:", ["Aluno", "Docente"], index=0, horizontal=True, key="role_sel")
+    email = st.text_input("E-mail institucional", key="login_email")
+    pin   = st.text_input("PIN (somente docentes)", type="password", key="login_pin") if role=="Docente" else None
 
-    if st.button("Entrar", type="primary"):
+    if st.button("Entrar", type="primary", key="btn_login"):
         if role == "Docente":
-            dfp = get_df("SELECT * FROM professors WHERE email=:e AND pin=:p", e=email.strip(), p=(pin or "").strip())
+            dfp = get_df("SELECT id,name,email,role FROM professors WHERE email=:e AND pin=:p",
+                         e=email.strip().lower(), p=(pin or "").strip())
             if dfp.empty:
-                st.error("Credenciais inválidas. Tente novamente.")
+                st.error("Credenciais inválidas.")
             else:
-                st.session_state["auth"] = {"role":"docente","email":email.strip(),
-                                            "name": dfp.iloc[0]["name"], "prof_id": int(dfp.iloc[0]["id"]),
-                                            "is_admin": (dfp.iloc[0]["role"] == "admin")}
+                prof = dfp.iloc[0]
+                st.session_state["auth"] = {
+                    "role":"docente",
+                    "name":prof["name"],
+                    "email":prof["email"],
+                    "prof_id":int(prof["id"]),
+                    "is_admin": (prof["role"]=="admin")
+                }
                 st.rerun()
         else:
-            # aluno por e-mail
-            dfa = get_df("SELECT * FROM students WHERE email=:e AND active=1", e=email.strip())
+            dfa = get_df("SELECT id,name,email,turma FROM students WHERE email=:e AND active=1",
+                         e=email.strip().lower())
             if dfa.empty:
-                st.error("E-mail não encontrado em 'students'. Vou notificar a coordenação.")
-                exec_sql("INSERT INTO pending_users(kind,email,created_at) VALUES('aluno',:e,:ts)",
-                         e=email.strip(), ts=datetime.now().isoformat(timespec="seconds"))
+                st.error("E-mail não encontrado em 'students'. Solicitando inclusão.")
+                exec_sql("""INSERT INTO pending_students(name, turma, requester, requested_at)
+                            VALUES(:n,:t,:r,:ts)""",
+                         n=email.strip(), t="", r="login", ts=datetime.now().isoformat(timespec="seconds"))
             else:
-                st.session_state["auth"] = {"role":"aluno","email":email.strip(),
-                                            "name": dfa.iloc[0]["name"], "student_id": int(dfa.iloc[0]["id"]),
-                                            "turma": dfa.iloc[0]["turma"]}
+                st.session_state["auth"] = {
+                    "role":"aluno",
+                    "name": dfa.iloc[0]["name"],
+                    "email": dfa.iloc[0]["email"],
+                    "student_id": int(dfa.iloc[0]["id"]),
+                    "turma": dfa.iloc[0]["turma"]
+                }
                 st.rerun()
 
 if "auth" not in st.session_state:
@@ -315,7 +341,7 @@ if "auth" not in st.session_state:
     st.stop()
 
 auth = st.session_state["auth"]
-st.success(f"Bem-vindo, {auth.get('name','usuário')}!")
+st.success(f"Bem-vindo(a), {auth.get('name','usuário')}!")
 
 # Tabs por papel
 if auth["role"] == "aluno":
@@ -323,113 +349,118 @@ if auth["role"] == "aluno":
 else:
     tabs = st.tabs(["1) Grupos & Temas", "2) Upload", "3) Galeria/Avaliação", "4) Administração", "5) Alunos & Docentes"])
 
-# -----------------------------------------------------------------------------
-# 1) GRUPOS & TEMAS
-# -----------------------------------------------------------------------------
+# =========================================================
+# (1) GRUPOS & TEMAS
+# =========================================================
 with tabs[0]:
-    st.subheader("Grupos (5–6 recomendado)")
-    gdf_all = list_groups()
+    st.subheader("Criar grupo (5–6 recomendado)")
+    # turma majoritária baseada no próprio aluno (ou escolha do docente)
+    if auth["role"] == "aluno":
+        base_turma = auth.get("turma") or "MA6"
+        nomes = [auth.get("name","")]
+    else:
+        base_turma = st.selectbox("Turma base", ["MA6","MB6","NA6","NB6"], key="turma_base")
+        nomes = [st.text_input("Primeiro membro (opcional)", value="", key="primeiro_membro").strip()] if st.checkbox("Informar primeiro membro", value=False) else []
 
-    # Criar/entrar grupo
-    c1, c2 = st.columns(2)
-    with c1:
-        turma_pref = st.selectbox("Turma base (p/ desempate)", ["MA6","MB6","NA6","NB6"], index=0, key="turma_pref")
-    with c2:
-        course = st.selectbox("Disciplina do grupo", ["IND","EBCII","JOINT"], index=0, key="course_code")
+    turma_sugerida = turma_majoritaria([n for n in nomes if n], base_turma)
+    code_sugerido  = proximo_codigo_por_turma(turma_sugerida)
+    course         = st.selectbox("Disciplina do grupo", ["IND","EBCII","JOINT"], index=0, key="group_course")
 
-    # Sugerir código automático a partir do próprio aluno (iniciador)
-    nomes_tmp = [auth.get("name","")]
-    turma_escolhida = turma_majoritaria(nomes_tmp, turma_pref)
-    code_sugerido = proximo_codigo_por_turma(turma_escolhida)
-
-    st.info(f"Sugestão de código (pela turma de maioria dos membros): **{code_sugerido}**")
-    if st.button("Criar meu grupo com esse código"):
+    st.info(f"Sugestão de código: **{code_sugerido}** (turma: {turma_sugerida})")
+    if st.button("Criar grupo", key="btn_criar_grupo"):
         try:
             exec_sql("""INSERT INTO groups(code,turma,course_code,created_by,created_at)
                         VALUES(:c,:t,:cc,:u,:ts)""",
-                     c=code_sugerido, t=turma_escolhida, cc=course,
+                     c=code_sugerido, t=turma_sugerida, cc=course,
                      u=auth.get("name",""), ts=datetime.now().isoformat(timespec="seconds"))
-            # adiciona auto ao grupo
-            gid = int(get_df("SELECT id FROM groups WHERE code=:c", c=code_sugerido)["id"].iloc[0])
-            exec_sql("INSERT OR IGNORE INTO group_members(group_id,student_name) VALUES(:g,:n)",
-                     g=gid, n=auth.get("name",""))
-            st.success(f"Grupo {code_sugerido} criado e você foi adicionado.")
+            # adiciona o criador se for aluno
+            if auth["role"] == "aluno":
+                gid = int(get_df("SELECT id FROM groups WHERE code=:c", c=code_sugerido)["id"].iloc[0])
+                exec_sql("INSERT OR IGNORE INTO group_members(group_id,student_name) VALUES(:g,:n)",
+                         g=gid, n=auth.get("name",""))
+            st.success(f"Grupo {code_sugerido} criado.")
         except Exception as e:
             st.error(f"Erro ao criar: {e}")
 
     st.markdown("---")
-    st.subheader("Adicionar membros (busca por turma + autocomplete)")
-
-    gdf = list_groups()
-    if gdf.empty:
+    st.subheader("Adicionar membros (autocomplete por turma)")
+    gdf_all = list_groups()
+    if gdf_all.empty:
         st.info("Crie um grupo primeiro.")
     else:
-        meus_grupos = gdf[gdf["code"].str.contains(turma_escolhida[:2], na=False)]["code"].tolist() or gdf["code"].tolist()
-        sel_group = st.selectbox("Selecione o grupo", sorted(set(meus_grupos + gdf["code"].tolist())), key="sel_group_add")
+        # Se aluno, sugere grupos que ele integra
+        if auth["role"] == "aluno":
+            meus = []
+            for _, r in gdf_all.iterrows():
+                if auth.get("name","") in group_details(r["code"]):
+                    meus.append(r["code"])
+            opts = meus or gdf_all["code"].tolist()
+        else:
+            opts = gdf_all["code"].tolist()
+        sel_group = st.selectbox("Selecione o grupo", opts, key="sel_group_add")
 
-        # filtro por turma e busca
-        turmas_disp = ["Todas","MA6","MB6","NA6","NB6"]
-        turma_filtro = st.selectbox("Filtrar turma", turmas_disp, index=turmas_disp.index(auth.get("turma","MA6")) if auth["role"]=="aluno" else 0)
-        if turma_filtro == "Todas":
+        turmas = ["Todas","MA6","MB6","NA6","NB6"]
+        tsel = st.selectbox("Filtrar turma", turmas, index=turmas.index(auth.get("turma","MA6")) if auth["role"]=="aluno" else 0, key="filtro_turma")
+        if tsel == "Todas":
             cand = get_df("SELECT name FROM students WHERE active=1 ORDER BY name")
         else:
-            cand = get_df("SELECT name FROM students WHERE turma=:t AND active=1 ORDER BY name", t=turma_filtro)
-        nomes = cand["name"].tolist()
-        novo_membro = st.selectbox("Adicionar membro (digite para filtrar)", nomes, index=None, placeholder="Nome do aluno…", key="membro_auto")
+            cand = get_df("SELECT name FROM students WHERE turma=:t AND active=1 ORDER BY name", t=tsel)
+        nomes_opt = cand["name"].tolist()
+        novo_membro = st.selectbox("Adicionar membro (digite para filtrar)", nomes_opt, index=None, placeholder="Nome do aluno…", key="novo_membro")
 
-        colx, coly = st.columns(2)
-        if colx.button("Adicionar ao grupo"):
+        c1, c2 = st.columns(2)
+        if c1.button("Adicionar"):
             if not novo_membro:
                 st.error("Selecione um nome.")
             else:
-                gid = int(gdf[gdf["code"] == sel_group]["id"].iloc[0])
+                gid = int(gdf_all[gdf_all["code"] == sel_group]["id"].iloc[0])
                 try:
                     exec_sql("INSERT OR IGNORE INTO group_members(group_id,student_name) VALUES(:g,:n)",
                              g=gid, n=novo_membro)
                     st.success("Membro adicionado.")
                 except Exception as e:
-                    st.error(f"Erro ao adicionar: {e}")
+                    st.error(f"Erro: {e}")
 
-        if coly.button("Remover último membro"):
-            gid = int(gdf[gdf["code"] == sel_group]["id"].iloc[0])
+        if c2.button("Remover último membro"):
+            gid = int(gdf_all[gdf_all["code"] == sel_group]["id"].iloc[0])
             exec_sql("""DELETE FROM group_members
-                        WHERE rowid IN (SELECT rowid FROM group_members
-                                        WHERE group_id=:g ORDER BY rowid DESC LIMIT 1)""", g=gid)
+                        WHERE rowid IN (
+                          SELECT rowid FROM group_members WHERE group_id=:g ORDER BY rowid DESC LIMIT 1
+                        )""", g=gid)
             st.warning("Último membro removido.")
 
         st.write("Membros atuais:", group_details(sel_group))
 
     st.markdown("---")
-    st.subheader("Reserva de tema (com mínimo por data)")
-
-    if gdf.empty:
-        st.info("Crie um grupo e adicione membros antes de reservar tema.")
+    st.subheader("Reserva de tema (mínimo de membros por data)")
+    if gdf_all.empty:
+        st.info("Crie um grupo e adicione membros antes de reservar.")
     else:
         hoje = datetime.now().date()
         limite = datetime.fromisoformat(DEADLINE_MIN5).date()
         min_req = 5 if hoje <= limite else MIN_AFTER_DEADLINE
-        st.caption(f"Regra atual: mínimo de **{min_req}** membros para reservar.")
+        st.caption(f"Regra atual: mínimo de **{min_req}** membro(s) para reservar tema.")
 
-        sel_group2 = st.selectbox("Grupo para reservar", gdf["code"].tolist(), key="reserve_group")
-        cat_res = st.selectbox("Filtrar por categoria", ["Todos","Privatização","Concessão","PPP","Financiamento/BNDES","Outro"], key="cat_res")
+        sel_group2 = st.selectbox("Grupo", gdf_all["code"].tolist(), key="reserve_group")
+        cat_res = st.selectbox("Categoria", ["Todos","Privatização","Concessão","PPP","Financiamento/BNDES","Outro"], key="cat_reserva")
         free_list = list_free_themes(cat_res)
-        theme_choice = st.selectbox("Temas disponíveis", free_list, index=0 if free_list else None)
+        tema = st.selectbox("Temas disponíveis", free_list, index=0 if free_list else None)
 
-        cols = st.columns(2)
-        if cols[0].button("Reservar tema"):
-            if not theme_choice:
+        colr1, colr2 = st.columns(2)
+        if colr1.button("Reservar tema"):
+            if not tema:
                 st.error("Escolha um tema.")
             else:
-                ok, msg = reserve_theme(theme_choice, sel_group2, min_req)
+                ok, msg = reserve_theme(tema, sel_group2, min_req)
                 st.success(msg) if ok else st.error(msg)
 
-        my_reserved = get_df("SELECT title FROM themes WHERE reserved_by=:g", g=sel_group2)["title"].tolist()
-        release_sel = st.selectbox("Liberar tema reservado (do seu grupo)", my_reserved, key="rel_sel") if my_reserved else None
-        if cols[1].button("Liberar tema"):
-            if not release_sel:
+        meus_reservados = get_df("SELECT title FROM themes WHERE reserved_by=:g", g=sel_group2)["title"].tolist()
+        tema_lib = st.selectbox("Liberar tema do seu grupo", meus_reservados, index=0 if meus_reservados else None, key="tema_lib")
+        if colr2.button("Liberar tema"):
+            if not tema_lib:
                 st.error("Seu grupo não possui tema reservado.")
             else:
-                ok, msg = release_theme(release_sel, auth.get("name",""))
+                ok, msg = release_theme(tema_lib, auth.get("name",""))
                 st.warning(msg) if ok else st.error(msg)
 
     st.markdown("---")
@@ -442,16 +473,15 @@ with tabs[0]:
                         FROM themes WHERE category=:c ORDER BY status DESC, number""", c=cat_view)
     st.dataframe(tdf, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# 2) UPLOAD
-# -----------------------------------------------------------------------------
+# =========================================================
+# (2) UPLOAD
+# =========================================================
 with tabs[1]:
     st.subheader("Upload de trabalhos finais")
     gdf = list_groups()
     if gdf.empty:
         st.info("Crie um grupo primeiro.")
     else:
-        # Se aluno, prioriza grupo em que ele é membro; se prof, lista todos
         if auth["role"] == "aluno":
             meus = []
             for _, r in gdf.iterrows():
@@ -461,27 +491,26 @@ with tabs[1]:
         else:
             opts = gdf["code"].tolist()
 
-        group = st.selectbox("Grupo", opts)
+        group = st.selectbox("Grupo", opts, key="upload_group")
         tdf = get_df("SELECT title FROM themes WHERE reserved_by=:g", g=group)
         theme = tdf["title"].iloc[0] if not tdf.empty else None
         if not theme:
             st.error("Este grupo ainda não reservou um tema.")
         else:
             st.write("Tema do grupo:", f"**{theme}**")
-            report = st.file_uploader("Relatório (PDF)", type=["pdf"])
-            slides = st.file_uploader("Apresentação (PPTX ou PDF)", type=["pptx","pdf"])
-            bundle = st.file_uploader("Materiais adicionais (ZIP)", type=["zip"])
-            video = st.text_input("Link do vídeo (YouTube, Stream, etc.)")
-            consent = st.checkbox("Cedo os direitos patrimoniais à PUC-SP para divulgação acadêmica/extensionista, com crédito aos autores.")
-            if st.button("Enviar"):
+            report = st.file_uploader("Relatório (PDF)", type=["pdf"], key="up_report")
+            slides = st.file_uploader("Apresentação (PPTX ou PDF)", type=["pptx","pdf"], key="up_slides")
+            bundle = st.file_uploader("Materiais adicionais (ZIP)", type=["zip"], key="up_zip")
+            video = st.text_input("Link do vídeo (YouTube, Stream, etc.)", key="up_video")
+            consent = st.checkbox("Cedo os direitos patrimoniais à PUC-SP para divulgação acadêmica/extensionista, com crédito aos autores.", key="up_consent")
+            if st.button("Enviar", key="btn_upload"):
                 if not consent:
                     st.error("É necessário marcar a cessão de direitos para enviar.")
                 else:
                     gdir = os.path.join(UPLOAD_DIR, group.replace('/', '_'))
                     os.makedirs(gdir, exist_ok=True)
                     def save_file(up, name):
-                        if up is None:
-                            return None
+                        if up is None: return None
                         p = os.path.join(gdir, name)
                         with open(p, "wb") as f:
                             f.write(up.getbuffer())
@@ -498,9 +527,7 @@ with tabs[1]:
 
     st.markdown("---")
     st.subheader("Submissões do seu grupo")
-    if gdf.empty:
-        pass
-    else:
+    if not gdf.empty:
         if auth["role"] == "aluno":
             vopts = []
             for _, r in gdf.iterrows():
@@ -515,9 +542,9 @@ with tabs[1]:
                        WHERE group_code=:g ORDER BY submitted_at DESC""", g=group2)
         st.dataframe(sdf, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# 3) GALERIA / AVALIAÇÃO (somente docentes)
-# -----------------------------------------------------------------------------
+# =========================================================
+# (3) GALERIA / AVALIAÇÃO (docentes)
+# =========================================================
 if auth["role"] == "docente" and len(tabs) >= 3:
     with tabs[2]:
         st.subheader("Avaliação por docentes")
@@ -546,9 +573,9 @@ if auth["role"] == "docente" and len(tabs) >= 3:
                   GROUP BY s.id ORDER BY likes DESC, media DESC""")
         st.dataframe(m, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# 4) ADMINISTRAÇÃO (somente docentes)
-# -----------------------------------------------------------------------------
+# =========================================================
+# (4) ADMINISTRAÇÃO (docentes)
+# =========================================================
 if auth["role"] == "docente" and len(tabs) >= 4:
     with tabs[3]:
         st.subheader("Aprovar submissões para galeria")
@@ -572,9 +599,25 @@ if auth["role"] == "docente" and len(tabs) >= 4:
             addn = ensure_themes_from_json(tmp)
             st.success(f"Temas adicionados: {addn}. (títulos existentes são ignorados)")
 
-# -----------------------------------------------------------------------------
-# 5) ALUNOS & DOCENTES (somente docentes)
-# -----------------------------------------------------------------------------
+        st.markdown("---")
+        st.subheader("Pedidos de inclusão de alunos (pendentes)")
+        pend = get_df("SELECT id,name,turma,requester,requested_at FROM pending_students ORDER BY requested_at DESC")
+        st.dataframe(pend, use_container_width=True)
+        to_ok = st.multiselect("IDs para aprovar", pend["id"].tolist() if not pend.empty else [])
+        if st.button("Aprovar selecionados"):
+            with engine.begin() as conn:
+                for pid in to_ok:
+                    row = conn.execute(text("SELECT * FROM pending_students WHERE id=:i"), {"i": int(pid)}).mappings().first()
+                    if row:
+                        conn.execute(text("""INSERT OR IGNORE INTO students(ra,name,email,turma,active)
+                                             VALUES(:ra,:n,:e,:t,1)"""),
+                                     {"ra": None, "n": row["name"], "e": None, "t": row["turma"] or ""})
+                        conn.execute(text("DELETE FROM pending_students WHERE id=:i"), {"i": int(pid)})
+            st.success("Aprovações concluídas.")
+
+# =========================================================
+# (5) ALUNOS & DOCENTES (docentes)
+# =========================================================
 if auth["role"] == "docente" and len(tabs) >= 5:
     with tabs[4]:
         st.subheader("Importar alunos (CSV) — colunas: ra,name,email,turma")
@@ -593,16 +636,17 @@ if auth["role"] == "docente" and len(tabs) >= 5:
         up_txt = st.file_uploader("Arquivos .txt", type=["txt"], accept_multiple_files=True, key="txts")
         if up_txt and st.button("Processar TXT"):
             try:
-                from app.modules.import_txt import parse_puc_txt, upsert_students_and_enroll  # caminho esperado
+                from app.modules.import_txt import parse_puc_txt, upsert_students_and_enroll
                 ok_count = 0
-                temp_dir = pathlib.Path(DATA_DIR) / "_tmp"; temp_dir.mkdir(parents=True, exist_ok=True)
+                tmp_dir = pathlib.Path(DATA_DIR) / "_tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
                 disc_map = {"ECONOMIA INDUSTRIAL":"IND", "EBC II":"EBCII", "EBCII":"EBCII"}
                 for upl in up_txt:
-                    fp = temp_dir / upl.name
+                    fp = tmp_dir / upl.name
                     fp.write_bytes(upl.read())
                     meta = parse_puc_txt(str(fp))
                     turma_txt = (meta.get("turma") or "")
-                    disc_code = disc_map.get(meta.get("disciplina","").upper(), "IND")
+                    disc_code = disc_map.get((meta.get("disciplina") or "").upper(), "IND")
                     if not turma_txt:
                         st.warning(f"{upl.name}: turma não detectada; ignorado.")
                         continue
@@ -610,8 +654,8 @@ if auth["role"] == "docente" and len(tabs) >= 5:
                     ok_count += 1
                 st.success(f"TXT processados: {ok_count}")
             except Exception as e:
-                st.error("Módulo 'app/modules/import_txt.py' não encontrado ou com erro.")
-                st.info("Crie 'app/modules/import_txt.py' com as funções parse_puc_txt(...) e upsert_students_and_enroll(...).")
+                st.error("Módulo 'app/modules/import_txt.py' ausente ou com erro.")
+                st.info("Crie 'app/modules/import_txt.py' com parse_puc_txt(...) e upsert_students_and_enroll(...).")
 
         st.markdown("---")
         st.subheader("Alunos sem grupo → alocar em grupos")
@@ -628,7 +672,7 @@ if auth["role"] == "docente" and len(tabs) >= 5:
                 st.error(str(e))
 
         st.markdown("---")
-        st.subheader("Docentes")
+        st.subheader("Docentes (gestão)")
         name = st.text_input("Nome")
         email = st.text_input("E-mail")
         role = st.selectbox("Papel", ["docente","admin"])
@@ -636,7 +680,8 @@ if auth["role"] == "docente" and len(tabs) >= 5:
         if st.button("Salvar docente"):
             exec_sql("""INSERT INTO professors(name,email,role,pin) VALUES(:n,:e,:r,:p)
                         ON CONFLICT(email) DO UPDATE SET name=:n, role=:r, pin=:p""",
-                     n=name,e=email,r=role,p=pinp)
+                     n=name, e=email, r=role, p=pinp)
             st.success("Docente salvo/atualizado.")
 
+# Rodapé
 st.caption("MVP – Submissões Industrial & EBC II (2º/2025)")
