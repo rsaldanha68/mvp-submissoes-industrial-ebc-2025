@@ -643,11 +643,13 @@ if selected_tab == "Administração":
             if st.button("Aprovar selecionadas"):
                 if to_approve:
                     with engine.begin() as conn:
-                        conn.execute(text(f"""
-                            UPDATE submissions
-                            SET approved = 1
-                            WHERE id IN ({','.join(['?'] * len(to_approve))})
-                        """), tuple(to_approve))
+                       if to_approve:
+                            with engine.begin() as conn:
+                                conn.execute(
+                                    text("UPDATE submissions SET approved = 1 WHERE id IN :ids"),
+                                    {"ids": tuple(to_approve)}
+                                  )
+
                     st.success(f"Aprovadas submissões IDs: {to_approve}")
                     st.experimental_rerun()
         # Aprovação de cadastros de docentes pendentes
