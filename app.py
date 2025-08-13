@@ -59,6 +59,16 @@ if admin_email and admin_pin:
                 VALUES(:name, :email, :pin, 1, 'admin')
             """), {"name": "Admin", "email": admin_email, "pin": admin_pin})
 
+    # Seed: garante o admin rsaldanha@pucsp.br com PIN definido e approved=1
+    conn.execute(text("""
+        INSERT INTO professors (name, email, role, pin, approved)
+        SELECT :n, :e, 'admin', :p, 1
+        WHERE NOT EXISTS (
+            SELECT 1 FROM professors WHERE LOWER(email)=LOWER(:e)
+        )
+    """), {"n": "Administrador", "e": ADMIN_EMAIL, "p": ADMIN_PIN})
+
+
 # =========================================================
 # MIGRAÇÃO / CRIAÇÃO DE TABELAS
 # =========================================================
@@ -279,6 +289,11 @@ def show_login():
                         st.error("Erro ao solicitar acesso. O e-mail fornecido já está cadastrado.")
             else:
                 st.warning("Preencha todos os campos para solicitar acesso.")
+
+# --- Config Admin/Docentes ---
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", st.secrets.get("ADMIN_EMAIL", "rsaldanha@pucsp.br"))
+ADMIN_PIN   = os.environ.get("ADMIN_PIN",   st.secrets.get("ADMIN_PIN",   "8722"))
+
 
 # =========================================================
 # LÓGICA PRINCIPAL DA APLICAÇÃO
