@@ -142,7 +142,33 @@ with engine.begin() as conn:
             value TEXT
         );
     """)
+# --- Seed: admin a partir de secrets/env (opcional, seguro para Cloud) ---
+import os
+import streamlit as st
+from sqlalchemy import text
 
+ADMIN_EMAIL = st.secrets.get("ADMIN_EMAIL", os.getenv("ADMIN_EMAIL", "rsaldanha@pucsp.br"))
+ADMIN_PIN   = st.secrets.get("ADMIN_PIN",   os.getenv("ADMIN_PIN",   "admin"))
+
+with engine.begin() as conn:
+    # garante tabela professors (caso o bloco de DDL acima mude de posição)
+    conn.exec_driver_sql("""
+    CREATE TABLE IF NOT EXISTS professors(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        role TEXT CHECK (role IN ('admin','docente')) DEFAULT 'docente',
+        pin TEXT,
+        approved INTEGER DEFAULT 0
+    );
+    """)
+    # se não existe nenhum admin aprovado, semeia um
+    row = conn.execute(text("SELECT 1 FROM professors WHERE role='admin' AND approved=1 LIMIT 1")).fetchone()
+    if not row:
+        conn.execute(text("""
+        INSERT OR IGNORE INTO professors(name, email, role, pin, approved)
+        VALUES(:n, :e, 'admin', :p, 1)
+        """), {"n": "Administrador", "e": ADMIN_EMAIL, "p": ADMIN_PIN})
 # Carregar temas iniciais (a partir do JSON) se não estiverem no banco
 try:
     with open(THEMES_FILE, 'r', encoding='utf-8') as f:
