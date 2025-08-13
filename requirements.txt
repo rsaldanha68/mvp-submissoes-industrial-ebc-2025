@@ -3,5 +3,5 @@ pandas==2.2.2
 sqlalchemy==2.0.30
 jinja2==3.1.4
 python-dateutil==2.9.0.post0
-msal
-requests
+msal==1.28.0
+requests==2.32.3
