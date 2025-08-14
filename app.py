@@ -1,18 +1,18 @@
-import os, json, pathlib, re, io, time
+import os, json, pathlib, re
 from datetime import datetime, date
 from typing import Optional, Tuple
+
+# Desativa watcher para evitar "inotify instance limit reached" em cloud
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
 
 import streamlit as st
 import pandas as pd
 import requests
 from sqlalchemy import create_engine, text
-from dateutil.parser import isoparse
 
-# =========================
-# 0) CONFIG & SEGREDOS
-# =========================
 st.set_page_config(page_title="Submissões – Industrial & EBC II (2º/2025)", layout="wide")
 
+# ========= 0) Segredos / Variáveis =========
 SECRETS = dict(getattr(st, "secrets", {}))
 ENV = os.environ
 
@@ -22,34 +22,26 @@ ADMIN_PIN   = (SECRETS.get("ADMIN_PIN")   or ENV.get("ADMIN_PIN")   or "admin").
 TENANT_ID     = SECRETS.get("TENANT_ID")     or ENV.get("TENANT_ID")
 CLIENT_ID     = SECRETS.get("CLIENT_ID")     or ENV.get("CLIENT_ID")
 CLIENT_SECRET = SECRETS.get("CLIENT_SECRET") or ENV.get("CLIENT_SECRET")
-SP_SITE_URL   = SECRETS.get("SP_SITE_URL")   or ENV.get("SP_SITE_URL")      # ex.: https://sidera.sharepoint.com/sites/PUC-Submissoes-Industrial
-SP_DRIVE_NAME = SECRETS.get("SP_DRIVE_NAME") or ENV.get("SP_DRIVE_NAME")    # ex.: "Documentos Compartilhados"
-SP_BASE_FOLDER= SECRETS.get("SP_BASE_FOLDER")or ENV.get("SP_BASE_FOLDER")   # ex.: "Submissoes_2025_2"
+SP_SITE_URL   = SECRETS.get("SP_SITE_URL")   or ENV.get("SP_SITE_URL")
+SP_DRIVE_NAME = SECRETS.get("SP_DRIVE_NAME") or ENV.get("SP_DRIVE_NAME")
+SP_BASE_FOLDER= SECRETS.get("SP_BASE_FOLDER")or ENV.get("SP_BASE_FOLDER")
 
-# =========================
-# 1) PASTAS & BANCO
-# =========================
-DATA_DIR   = "data"
-UPLOAD_DIR = "uploads"
-PUBLIC_DIR = "public"
-
+# ========= 1) Pastas / Banco =========
+DATA_DIR, UPLOAD_DIR, PUBLIC_DIR = "data", "uploads", "public"
 for p in (DATA_DIR, UPLOAD_DIR, PUBLIC_DIR):
     os.makedirs(p, exist_ok=True)
 
 DB_URL = f"sqlite:///{os.path.join(DATA_DIR, 'app.db')}"
 engine = create_engine(DB_URL, future=True)
 
-# =========================
-# 2) SCHEMA (TABELAS)
-# =========================
+# ========= 2) Schema =========
 def bootstrap_db():
     with engine.begin() as conn:
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS settings(
           key TEXT PRIMARY KEY,
           value TEXT
-        );""")
-
+        )""")
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS groups(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,16 +49,14 @@ def bootstrap_db():
           turma TEXT,
           created_by TEXT,
           created_at TEXT
-        );""")
-
+        )""")
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS group_members(
           group_id INTEGER NOT NULL,
           student_name TEXT NOT NULL,
           turma TEXT,
           UNIQUE(group_id, student_name)
-        );""")
-
+        )""")
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS themes(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,8 +66,7 @@ def bootstrap_db():
           status TEXT CHECK (status IN ('livre','reservado')) DEFAULT 'livre',
           reserved_by TEXT,
           reserved_at TEXT
-        );""")
-
+        )""")
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS submissions(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,9 +82,8 @@ def bootstrap_db():
           submitted_by TEXT,
           submitted_at TEXT,
           approved INTEGER DEFAULT 0,
-          sp_urls TEXT  -- JSON com URLs do SharePoint dos arquivos enviados
-        );""")
-
+          sp_urls TEXT
+        )""")
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS students(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,8 +92,7 @@ def bootstrap_db():
           email TEXT,
           turma TEXT,
           active INTEGER DEFAULT 1
-        );""")
-
+        )""")
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS professors(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,8 +101,7 @@ def bootstrap_db():
           role TEXT CHECK (role IN ('admin','docente')) DEFAULT 'docente',
           pin TEXT,
           approved INTEGER DEFAULT 1
-        );""")
-
+        )""")
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS reviews(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,9 +112,8 @@ def bootstrap_db():
           comment TEXT,
           created_at TEXT,
           UNIQUE(submission_id, instructor_id)
-        );""")
-
-        # defaults de política
+        )""")
+        # Defaults de política
         conn.execute(text("""
         INSERT OR IGNORE INTO settings(key,value) VALUES
         ('MIN_GROUP_SIZE','5'),
@@ -138,32 +123,30 @@ def bootstrap_db():
 
 bootstrap_db()
 
-# =========================
-# 3) UTILS BD
-# =========================
-def get_df(sql:str, **params):
+# ========= 3) Utils BD =========
+def get_df(sql: str, **params):
     with engine.begin() as c:
         return pd.read_sql(text(sql), c, params=params)
 
-def exec_sql(sql:str, **params):
+def exec_sql(sql: str, **params):
     with engine.begin() as c:
         c.execute(text(sql), params)
 
-def get_setting(key:str, default:str=""):
+def get_setting(key: str, default: str = ""):
     df = get_df("SELECT value FROM settings WHERE key=:k", k=key)
     return (df["value"].iloc[0] if not df.empty else default) or default
 
-def set_setting(key:str, value:str):
-    exec_sql("INSERT INTO settings(key,value) VALUES(:k,:v) ON CONFLICT(key) DO UPDATE SET value=:v", k=key, v=str(value))
+def set_setting(key: str, value: str):
+    exec_sql("""
+      INSERT INTO settings(key,value) VALUES(:k,:v)
+      ON CONFLICT(key) DO UPDATE SET value=:v
+    """, k=key, v=str(value))
 
-# =========================
-# 4) THEMES (seed opcional)
-# =========================
-def ensure_themes_from_json(path_json:str) -> int:
+# ========= 4) Temas (seed opcional) =========
+def ensure_themes_from_json(path_json: str) -> int:
     if not os.path.exists(path_json):
         return 0
-    with open(path_json, "r", encoding="utf-8") as f:
-        items = json.load(f) or []
+    items = json.loads(pathlib.Path(path_json).read_text("utf-8")) or []
     inserted = 0
     with engine.begin() as conn:
         existing = pd.read_sql("SELECT title FROM themes", conn)
@@ -177,98 +160,90 @@ def ensure_themes_from_json(path_json:str) -> int:
             conn.execute(text("""
               INSERT INTO themes(number,title,category,status)
               VALUES(:n,:t,:c,'livre')
-            """), {"n":num,"t":title,"c":cat})
+            """), {"n": num, "t": title, "c": cat})
             inserted += 1
     return inserted
 
-# carrega themes_2025_2.json se existir
 added = ensure_themes_from_json(os.path.join("data","themes_2025_2.json"))
 if added:
     st.sidebar.success(f"Temas adicionados: +{added}")
 
-# =========================
-# 5) PROFESSORES (seed)
-# =========================
+# ========= 5) Professores (seed) =========
 DOCENTES_SEED = [
     ("ROLAND VERAS SALDANHA JUNIOR", "rsaldanha@pucsp.br", "admin", "8722", 1),
-    ("MARCIA FLAIRE PEDROZA",        "marciapedroza@pucsp.br", "docente", "0000", 1),
-    ("JULIO MANUEL PIRES",           "jmpires@pucsp.br",       "docente", "0000", 1),
-    ("Raphael Almeida Videira",      "ravideira@pucsp.br",     "docente", "0000", 1),
-    ("Tomas Bruginski de Paula",     "tbruginski@pucsp.br",    "docente", "0000", 1),
+    ("MARCIA FLAIRE PEDROZA",        "marciapedroza@pucsp.br", "docente", "1234", 1),
+    ("JULIO MANUEL PIRES",           "jmpires@pucsp.br",       "docente", "1234", 1),
+    ("Raphael Almeida Videira",      "ravideira@pucsp.br",     "docente", "1234", 1),
+    ("Tomas Bruginski de Paula",     "tbruginski@pucsp.br",    "docente", "1234", 1),
 ]
+with engine.begin() as conn:
+    for n,e,r,p,ap in DOCENTES_SEED:
+        conn.execute(text("""
+          INSERT OR IGNORE INTO professors(name,email,role,pin,approved)
+          VALUES(:n,:e,:r,:p,:a)
+        """), {"n":n, "e":e.lower(), "r":r, "p":p, "a":ap})
 
-def seed_professors():
-    with engine.begin() as conn:
-        for name,email,role,pin,approved in DOCENTES_SEED:
-            conn.execute(text("""
-              INSERT OR IGNORE INTO professors(name,email,role,pin,approved)
-              VALUES(:n,:e,:r,:p,:a)
-            """), {"n":name, "e":email.lower(), "r":role, "p":pin, "a":approved})
-
-seed_professors()
-
-# =========================
-# 6) GRUPOS & REGRAS
-# =========================
+# ========= 6) Grupos & Regras =========
 def list_groups():
     return get_df("SELECT id, code, turma FROM groups ORDER BY turma, code")
 
-def group_members(code:str):
-    return get_df("""SELECT gm.student_name, gm.turma
-                       FROM group_members gm
-                       JOIN groups g ON g.id=gm.group_id
-                      WHERE g.code=:c
-                   """, c=code)
+def group_members(code: str):
+    return get_df("""
+      SELECT gm.student_name, gm.turma
+        FROM group_members gm
+        JOIN groups g ON g.id=gm.group_id
+       WHERE g.code=:c
+    """, c=code)
 
-def next_group_code_for_turma(turma:str)->str:
+def next_group_code_for_turma(turma: str) -> str:
     base = turma.upper().strip()
     df = get_df("SELECT code FROM groups WHERE turma=:t ORDER BY code", t=base)
     nums = []
     for c in df["code"].tolist():
         m = re.search(r"G(\d+)$", c)
-        if m:
-            nums.append(int(m.group(1)))
-    nxt = (max(nums) + 1) if nums else 1
+        if m: nums.append(int(m.group(1)))
+    nxt = (max(nums)+1) if nums else 1
     return f"{base}G{nxt}"
 
 def enforce_min_group() -> Tuple[int, bool]:
-    min_sz = int(get_setting("MIN_GROUP_SIZE", "5"))
-    until  = get_setting("ENFORCE_UNTIL", "2025-09-01")
+    from dateutil.parser import isoparse
+    min_sz = int(get_setting("MIN_GROUP_SIZE","5"))
+    until = get_setting("ENFORCE_UNTIL","2025-09-01")
     try:
         enforce = date.today() <= isoparse(until).date()
     except Exception:
         enforce = True
     return min_sz, enforce
 
-def reserve_theme(theme_title:str, group_code:str) -> Tuple[bool,str]:
+def reserve_theme(theme_title: str, group_code: str) -> Tuple[bool,str]:
     min_sz, enforce = enforce_min_group()
     mdf = group_members(group_code)
     if enforce and (len(mdf) < min_sz):
-        return False, f"Grupo abaixo de {min_sz} membro(s) até a data limite."
+        return False, f"Grupo abaixo de {min_sz} integrante(s) até a data-limite."
     with engine.begin() as c:
-        row = c.execute(text("SELECT status FROM themes WHERE title=:t"), {"t": theme_title}).fetchone()
+        row = c.execute(text("SELECT status FROM themes WHERE title=:t"), {"t":theme_title}).fetchone()
         if not row or row[0] != "livre":
             return False, "Tema já reservado."
-        c.execute(text("""UPDATE themes
-                            SET status='reservado', reserved_by=:g, reserved_at=:ts
-                          WHERE title=:t
-                       """), {"g": group_code, "t": theme_title, "ts": datetime.now().isoformat(timespec="seconds")})
+        c.execute(text("""
+          UPDATE themes
+             SET status='reservado', reserved_by=:g, reserved_at=:ts
+           WHERE title=:t
+        """), {"g":group_code, "t":theme_title, "ts":datetime.now().isoformat(timespec="seconds")})
     return True, "Tema reservado."
 
-def release_theme(theme_title:str) -> Tuple[bool,str]:
+def release_theme(theme_title: str) -> Tuple[bool,str]:
     with engine.begin() as c:
-        row = c.execute(text("SELECT status FROM themes WHERE title=:t"), {"t": theme_title}).fetchone()
+        row = c.execute(text("SELECT status FROM themes WHERE title=:t"), {"t":theme_title}).fetchone()
         if not row or row[0] != "reservado":
             return False, "Tema não está reservado."
-        c.execute(text("""UPDATE themes
-                            SET status='livre', reserved_by=NULL, reserved_at=NULL
-                          WHERE title=:t
-                       """), {"t": theme_title})
+        c.execute(text("""
+          UPDATE themes
+             SET status='livre', reserved_by=NULL, reserved_at=NULL
+           WHERE title=:t
+        """), {"t":theme_title})
     return True, "Tema liberado."
 
-# =========================
-# 7) SHAREPOINT (Graph)
-# =========================
+# ========= 7) SharePoint (Graph) =========
 def graph_token() -> Optional[str]:
     if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET):
         return None
@@ -277,8 +252,8 @@ def graph_token() -> Optional[str]:
             f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token",
             data={
                 "grant_type":"client_credentials",
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
+                "client_id":CLIENT_ID,
+                "client_secret":CLIENT_SECRET,
                 "scope":"https://graph.microsoft.com/.default"
             },
             timeout=30
@@ -286,45 +261,39 @@ def graph_token() -> Optional[str]:
         if resp.ok:
             return resp.json().get("access_token")
     except Exception:
-        pass
+        return None
     return None
 
 @st.cache_resource(show_spinner=False)
-def _resolve_site_drive(_site_url:str, _drive_name:str):
-    """Resolve siteId e driveId via Graph e guarda em cache."""
+def _resolve_site_drive(_site_url: str, _drive_name: str):
     token = graph_token()
     if not token:
         return None, None
-    # siteId a partir da URL
     host = re.sub(r"^https://", "", _site_url).split("/")[0]
     rel  = _site_url.replace(f"https://{host}", "")
-    site = requests.get(
+    s = requests.get(
         f"https://graph.microsoft.com/v1.0/sites/{host}:{rel}",
         headers={"Authorization":f"Bearer {token}"},
         timeout=30
     )
-    if not site.ok:
+    if not s.ok:
         return None, None
-    site_id = site.json().get("id")
-
-    drives = requests.get(
+    site_id = s.json().get("id")
+    d = requests.get(
         f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives",
         headers={"Authorization":f"Bearer {token}"},
         timeout=30
     )
-    if not drives.ok:
+    if not d.ok:
         return site_id, None
-    djson = drives.json().get("value", [])
     drive_id = None
-    for d in djson:
-        if d.get("name") == _drive_name:
-            drive_id = d.get("id")
-            break
+    for drv in d.json().get("value", []):
+        if drv.get("name") == _drive_name:
+            drive_id = drv.get("id"); break
     return site_id, drive_id
 
-def sp_upload_bytes(folder:str, filename:str, data:bytes) -> Optional[str]:
-    """Envia bytes para pasta no SharePoint (retorna URL pública interna)."""
-    if not get_setting("SP_ENABLED","1") == "1":
+def sp_upload_bytes(folder: str, filename: str, data: bytes) -> Optional[str]:
+    if get_setting("SP_ENABLED","1") != "1":
         return None
     if not (SP_SITE_URL and SP_DRIVE_NAME):
         return None
@@ -337,45 +306,45 @@ def sp_upload_bytes(folder:str, filename:str, data:bytes) -> Optional[str]:
 
     clean_folder = "/".join([x for x in [SP_BASE_FOLDER or "", folder or ""] if x]).strip("/")
     target_path  = f"{clean_folder}/{filename}" if clean_folder else filename
-
     url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{target_path}:/content"
     r = requests.put(url, headers={"Authorization":f"Bearer {token}"}, data=data, timeout=120)
     if r.ok:
-        weburl = r.json().get("webUrl")
-        return weburl
+        return r.json().get("webUrl")
     return None
 
-# =========================
-# 8) LOGIN
-# =========================
+# ========= 8) Login =========
 def login_block():
     st.subheader("Login")
     who = st.radio("Sou:", ["Aluno","Docente"], horizontal=True)
-    if who == "Docente":
-        email = st.text_input("E-mail institucional")
-        pin   = st.text_input("PIN", type="password")
-        if st.button("Entrar", key="doc_login"):
-            email_norm = (email or "").strip().lower()
-            with engine.begin() as c:
-                prof = c.execute(text("""
-                    SELECT id,name,email,role,pin,approved FROM professors WHERE LOWER(email)=:e
-                """), {"e":email_norm}).fetchone()
 
-                # auto-provisiona admin
+    if who == "Docente":
+        email = st.text_input("E-mail institucional", key="doc_email")
+        pin   = st.text_input("PIN", type="password", key="doc_pin")
+        if st.button("Entrar (docente)", key="doc_login_btn"):
+            email_norm = (email or "").strip().lower()
+            with engine.begin() as conn:
+                prof = conn.execute(text("""
+                    SELECT id, name, email, role, pin, approved
+                      FROM professors
+                     WHERE LOWER(email)=:e
+                """), {"e":email_norm}).mappings().fetchone()  # <- evita tuple error
+
+                # Auto-provisiona admin pelo ADMIN_EMAIL
                 if not prof and ADMIN_EMAIL and email_norm == ADMIN_EMAIL.lower():
-                    c.execute(text("""
+                    conn.execute(text("""
                         INSERT INTO professors(name,email,role,pin,approved)
                         VALUES('Administrador', :e, 'admin', :p, 1)
-                    """), {"e":email_norm, "p":(pin or ADMIN_PIN)})
-                    prof = c.execute(text("""
-                        SELECT id,name,email,role,pin,approved FROM professors WHERE LOWER(email)=:e
-                    """), {"e":email_norm}).fetchone()
+                    """), {"e": email_norm, "p": (pin or ADMIN_PIN)})
+                    prof = conn.execute(text("""
+                        SELECT id, name, email, role, pin, approved
+                          FROM professors WHERE LOWER(email)=:e
+                    """), {"e":email_norm}).mappings().fetchone()
 
                 if not prof:
                     st.error("Conta de docente não encontrada. Solicite acesso na aba Administração.")
-                elif int(prof["approved"]) != 1:
+                elif int(prof.get("approved", 0)) != 1:
                     st.warning("Conta pendente de aprovação.")
-                elif (pin or "") != (prof["pin"] or ""):
+                elif (pin or "") != (prof.get("pin") or ""):
                     st.error("PIN inválido.")
                 else:
                     st.session_state["auth"] = {
@@ -383,15 +352,15 @@ def login_block():
                         "id":int(prof["id"]),
                         "email":prof["email"],
                         "name":prof["name"],
-                        "role":prof["role"]
+                        "role":prof.get("role") or "docente"
                     }
                     st.success("Login efetuado.")
                     st.experimental_rerun()
 
     else:
-        ra = st.text_input("RA")
-        if st.button("Entrar", key="aluno_login"):
-            df = get_df("SELECT id,ra,name,email,turma FROM students WHERE ra=:r AND active=1", r=ra.strip())
+        ra = st.text_input("RA", key="al_ra")
+        if st.button("Entrar (aluno)", key="al_login_btn"):
+            df = get_df("SELECT id,ra,name,email,turma FROM students WHERE ra=:r AND active=1", r=(ra or "").strip())
             if df.empty:
                 st.error("RA não encontrado. Solicite cadastro na aba Alunos & Docentes.")
             else:
@@ -407,27 +376,15 @@ def login_block():
                 st.success(f"Bem-vindo(a), {row['name']}!")
                 st.experimental_rerun()
 
-# =========================
-# 9) UI HELPERS
-# =========================
 def can_access(tab_for:str)->bool:
     a = st.session_state.get("auth")
-    if not a:
-        return False
-    if tab_for == "aluno":
-        return a.get("who") == "aluno"
-    if tab_for == "docente":
-        return a.get("who") == "docente"
-    if tab_for == "admin":
-        return a.get("who") == "docente" and a.get("role") == "admin"
+    if not a: return False
+    if tab_for == "aluno":  return a.get("who") == "aluno"
+    if tab_for == "docente":return a.get("who") == "docente"
+    if tab_for == "admin":  return a.get("who") == "docente" and a.get("role") == "admin"
     return False
 
-def human(a):
-    return "—" if not a else str(a)
-
-# =========================
-# 10) TABS
-# =========================
+# ========= 9) UI =========
 st.title("Submissões – Industrial & EBC II (2º/2025)")
 auth = st.session_state.get("auth")
 if not auth:
@@ -435,34 +392,29 @@ if not auth:
     st.stop()
 
 tabs = st.tabs([
-    "1) Grupos & Temas",             # aluno + docente
-    "2) Upload",                     # aluno + docente
-    "3) Pré-Galeria (avaliação)",    # docente
-    "4) Administração",              # admin
-    "5) Alunos & Docentes"           # docente
+    "1) Grupos & Temas",
+    "2) Upload",
+    "3) Pré-Galeria (avaliação)",
+    "4) Administração",
+    "5) Alunos & Docentes"
 ])
 
-# 10.1) GRUPOS & TEMAS
+# ----- 1) Grupos & Temas
 with tabs[0]:
     st.subheader("Gerenciar grupos e temas")
+    from dateutil.parser import isoparse
     min_sz, enforce = enforce_min_group()
-    st.caption(f"Regra: mínimo {min_sz} integrante(s){' (em vigor até ' + get_setting('ENFORCE_UNTIL') + ')' if enforce else ''}.")
+    st.caption(f"Regra: mínimo {min_sz} integrante(s){' (até ' + get_setting('ENFORCE_UNTIL') + ')' if enforce else ''}.")
 
-    # criar grupo (docente pode criar livremente; aluno cria para sua turma)
     c1,c2,c3 = st.columns([1,1,2])
     with c1:
-        if auth["who"] == "aluno":
-            turma = st.text_input("Turma", value=auth.get("turma","")).upper()
-        else:
-            turma = st.text_input("Turma", value="MA6").upper()
+        turma = st.text_input("Turma", value=(auth.get("turma") if auth["who"]=="aluno" else "MA6")).upper()
     with c2:
-        auto_code = st.checkbox("Código automático (por turma)", value=True)
-        if auto_code:
-            code_input = next_group_code_for_turma(turma) if turma else ""
-        else:
-            code_input = st.text_input("Código (ex.: MA6G1)")
+        auto_code = st.checkbox("Código automático", value=True)
+        code_input = st.text_input("Código (ex.: MA6G1)") if not auto_code else next_group_code_for_turma(turma) if turma else ""
     with c3:
         created_by = st.text_input("Seu nome", value=auth.get("name",""))
+
     if st.button("Criar grupo"):
         code = code_input if not auto_code else next_group_code_for_turma(turma)
         try:
@@ -484,41 +436,45 @@ with tabs[0]:
         members = group_members(sel_group)
         st.dataframe(members, use_container_width=True)
 
-        m1,m2 = st.columns([2,1])
-        with m1:
-            # escolha de aluno por RA → usa students
-            sterm = st.text_input("Pesquisar aluno (RA ou nome contém)")
-            if sterm:
-                q = f"%{sterm.lower()}%"
-                sdf = get_df("""SELECT id,ra,name,turma FROM students
-                                WHERE active=1 AND (LOWER(ra) LIKE :q OR LOWER(name) LIKE :q)
-                                ORDER BY turma,name LIMIT 100""", q=q)
+        # Busca por RA/nome
+        sterm = st.text_input("Pesquisar aluno (RA/nome contém)")
+        if sterm:
+            q = f"%{sterm.lower()}%"
+            sdf = get_df("""
+              SELECT id,ra,name,turma
+                FROM students
+               WHERE active=1 AND (LOWER(ra) LIKE :q OR LOWER(name) LIKE :q)
+               ORDER BY turma,name LIMIT 100
+            """, q=q)
+        else:
+            sdf = pd.DataFrame()
+
+        sel = st.selectbox(
+            "Selecione",
+            sdf.apply(lambda r: f"{r['ra']} — {r['name']} ({r['turma']})", axis=1).tolist()
+            if not sdf.empty else [], index=None
+        )
+        if st.button("Adicionar ao grupo"):
+            if not sel:
+                st.warning("Escolha um aluno.")
             else:
-                sdf = pd.DataFrame()
-            sid = st.selectbox("Selecione por RA - Nome", 
-                               sdf.apply(lambda r: f"{r['ra']} — {r['name']} ({r['turma']})", axis=1).tolist()
-                               if not sdf.empty else [], index=None)
-        with m2:
-            if st.button("Adicionar ao grupo"):
-                if not sid:
-                    st.warning("Escolha um aluno.")
-                else:
-                    ra = sid.split(" — ")[0]
-                    row = get_df("SELECT name,turma FROM students WHERE ra=:r", r=ra).iloc[0]
-                    gid = int(gdf[gdf["code"] == sel_group]["id"].iloc[0])
-                    try:
-                        exec_sql("""INSERT INTO group_members(group_id,student_name,turma)
-                                    VALUES(:g,:n,:t)""", g=gid, n=row["name"], t=row["turma"])
-                        st.success("Adicionado.")
-                    except Exception as e:
-                        st.error(str(e))
+                ra = sel.split(" — ")[0]
+                row = get_df("SELECT name,turma FROM students WHERE ra=:r", r=ra).iloc[0]
+                gid = int(gdf[gdf["code"] == sel_group]["id"].iloc[0])
+                try:
+                    exec_sql("""
+                      INSERT INTO group_members(group_id,student_name,turma)
+                      VALUES(:g,:n,:t)
+                    """, g=gid, n=row["name"], t=row["turma"])
+                    st.success("Adicionado.")
+                except Exception as e:
+                    st.error(str(e))
 
     st.markdown("---")
     st.subheader("Reserva de tema")
     if not gdf.empty:
         sel_group2 = st.selectbox("Grupo", gdf["code"].tolist(), key="res_g")
-        cat = st.selectbox("Categoria",
-                           ["Todos","Privatização","Concessão","PPP","Financiamento/BNDES","Outro"])
+        cat = st.selectbox("Categoria", ["Todos","Privatização","Concessão","PPP","Financiamento/BNDES","Outro"])
         if cat == "Todos":
             free = get_df("SELECT title FROM themes WHERE status='livre' ORDER BY number")["title"].tolist()
         else:
@@ -526,13 +482,12 @@ with tabs[0]:
         choice = st.selectbox("Temas disponíveis", free)
         colr1,colr2 = st.columns(2)
         if colr1.button("Reservar"):
-            ok, msg = reserve_theme(choice, sel_group2)
+            ok,msg = reserve_theme(choice, sel_group2)
             st.success(msg) if ok else st.error(msg)
-        # liberar
         my_reserved = get_df("SELECT title FROM themes WHERE reserved_by=:g", g=sel_group2)["title"].tolist()
         rel = st.selectbox("Liberar tema do grupo", my_reserved) if my_reserved else None
         if colr2.button("Liberar"):
-            if not rel: st.warning("Nada reservado."); 
+            if not rel: st.warning("Nada reservado.")
             else:
                 ok,msg = release_theme(rel)
                 st.success(msg) if ok else st.error(msg)
@@ -546,7 +501,7 @@ with tabs[0]:
         tdf = get_df("SELECT number,title,category,status,reserved_by,reserved_at FROM themes WHERE category=:c ORDER BY status DESC, number", c=cat2)
     st.dataframe(tdf, use_container_width=True)
 
-# 10.2) UPLOAD
+# ----- 2) Upload
 with tabs[1]:
     st.subheader("Upload de trabalhos")
     gdf = list_groups()
@@ -560,15 +515,13 @@ with tabs[1]:
             st.error("Grupo sem tema reservado.")
         else:
             st.write("Tema:", f"**{theme}**")
-
             report = st.file_uploader("Relatório (PDF)", type=["pdf"])
             slides = st.file_uploader("Apresentação (PPTX/PDF)", type=["pptx","pdf"])
             bundle = st.file_uploader("Arquivos adicionais (ZIP)", type=["zip"])
-            video  = st.file_uploader("Vídeo (mp4, mov, webm) – opcional", type=["mp4","mov","webm"])
-            audio  = st.file_uploader("Áudio (mp3, wav, m4a) – opcional", type=["mp3","wav","m4a"])
+            video  = st.file_uploader("Vídeo (mp4/mov/webm) – opcional", type=["mp4","mov","webm"])
+            audio  = st.file_uploader("Áudio (mp3/wav/m4a) – opcional", type=["mp3","wav","m4a"])
             video_link = st.text_input("Link de vídeo (YouTube/Stream/etc.) – opcional")
-
-            consent = st.checkbox("Cedo os direitos patrimoniais à PUC-SP…")
+            consent = st.checkbox("Cedo os direitos patrimoniais à PUC-SP para divulgação acadêmica/extensionista, com crédito aos autores.")
             submitted_by = st.text_input("Seu nome (quem envia)", value=auth.get("name",""))
 
             if st.button("Enviar"):
@@ -577,16 +530,15 @@ with tabs[1]:
                 else:
                     gdir = pathlib.Path(UPLOAD_DIR) / group.replace("/","_")
                     gdir.mkdir(parents=True, exist_ok=True)
-
                     sp_urls = {}
-                    def save_and_push(up, fname)->Optional[str]:
+
+                    def save_and_push(up, fname):
                         if up is None: return None
-                        p = gdir / fname
-                        p.write_bytes(up.getbuffer())
-                        # tenta SharePoint
-                        url = sp_upload_bytes(f"{group}", fname, up.getbuffer())
+                        path = gdir / fname
+                        path.write_bytes(up.getbuffer())
+                        url = sp_upload_bytes(group, fname, up.getbuffer())
                         if url: sp_urls[fname] = url
-                        return str(p)
+                        return str(path)
 
                     rpath = save_and_push(report, "relatorio.pdf")
                     spath = save_and_push(slides, "apresentacao."+ (slides.name.split(".")[-1] if slides else "pdf"))
@@ -596,11 +548,10 @@ with tabs[1]:
 
                     exec_sql("""
                       INSERT INTO submissions(group_code,theme_title,report_path,slides_path,zip_path,video_path,audio_path,video_link,
-                                              consent,submitted_by,submitted_at,approved, sp_urls)
-                      VALUES(:g,:t,:r,:s,:z,:vp,:ap,:vl, :c,:u,:ts,0,:sp)
+                                              consent,submitted_by,submitted_at,approved,sp_urls)
+                      VALUES(:g,:t,:r,:s,:z,:vp,:ap,:vl,:c,:u,:ts,0,:sp)
                     """, g=group, t=theme, r=rpath, s=spath, z=zpath, vp=vpath, ap=apath, vl=video_link,
-                         c=1 if consent else 0, u=submitted_by.strip(),
-                         ts=datetime.now().isoformat(timespec="seconds"),
+                         c=1, u=submitted_by.strip(), ts=datetime.now().isoformat(timespec="seconds"),
                          sp=json.dumps(sp_urls, ensure_ascii=False))
                     st.success("Submissão recebida. Entrará na **Pré‑galeria** para avaliação dos docentes.")
 
@@ -614,7 +565,7 @@ with tabs[1]:
         """, g=gsel)
         st.dataframe(sdf, use_container_width=True)
 
-# 10.3) PRÉ‑GALERIA (DOCENTE)
+# ----- 3) Pré-Galeria (docente)
 with tabs[2]:
     if not can_access("docente"):
         st.info("Acesso restrito a docentes.")
@@ -622,7 +573,7 @@ with tabs[2]:
         st.subheader("Pré‑galeria (avaliação interna)")
         sdf = get_df("""
           SELECT id, group_code, theme_title, submitted_by, submitted_at, approved
-          FROM submissions ORDER BY submitted_at DESC
+            FROM submissions ORDER BY submitted_at DESC
         """)
         st.dataframe(sdf, use_container_width=True)
         sid = st.selectbox("Escolha o ID para avaliar", sdf["id"].tolist() if not sdf.empty else [])
@@ -651,14 +602,14 @@ with tabs[2]:
         """)
         st.dataframe(m, use_container_width=True)
 
-# 10.4) ADMIN
+# ----- 4) Administração (admin)
 with tabs[3]:
     if not can_access("admin"):
         st.info("Acesso restrito à coordenação/admin.")
     else:
         st.subheader("Políticas")
-        min_g = st.number_input("Mínimo de integrantes", min_value=1, max_value=10,
-                                value=int(get_setting("MIN_GROUP_SIZE","5")))
+        from dateutil.parser import isoparse
+        min_g = st.number_input("Mínimo de integrantes", 1, 10, int(get_setting("MIN_GROUP_SIZE","5")))
         until = st.date_input("Aplicar mínimo até", value=isoparse(get_setting("ENFORCE_UNTIL","2025-09-01")).date())
         sp_en = st.checkbox("Replicar arquivos no SharePoint", value=get_setting("SP_ENABLED","1")=="1")
         if st.button("Salvar políticas"):
@@ -671,7 +622,7 @@ with tabs[3]:
         st.subheader("Publicar na galeria externa")
         sdf = get_df("SELECT id, group_code, theme_title, submitted_at, approved FROM submissions ORDER BY submitted_at DESC")
         st.dataframe(sdf, use_container_width=True)
-        ids = st.multiselect("IDs para publicar (approved=1)", sdf["id"].tolist())
+        ids = st.multiselect("IDs para publicar (aprovar)", sdf["id"].tolist())
         if st.button("Publicar selecionados"):
             for i in ids:
                 exec_sql("UPDATE submissions SET approved=1 WHERE id=:i", i=int(i))
@@ -681,25 +632,25 @@ with tabs[3]:
         st.subheader("Gerir docentes")
         pdf = get_df("SELECT id,name,email,role,approved FROM professors ORDER BY role DESC, name")
         st.dataframe(pdf, use_container_width=True)
-        n,c,e,r,p = st.columns([2,2,2,1,1])
-        with n:
-            name = st.text_input("Nome")
-        with c:
-            email= st.text_input("E-mail")
-        with r:
-            role = st.selectbox("Papel", ["docente","admin"])
-        with p:
-            pin  = st.text_input("PIN")
+        c1,c2,c3,c4 = st.columns([2,2,1,1])
+        with c1:
+            pname = st.text_input("Nome")
+        with c2:
+            pemail= st.text_input("E-mail")
+        with c3:
+            prole = st.selectbox("Papel", ["docente","admin"])
+        with c4:
+            ppin  = st.text_input("PIN")
         if st.button("Salvar/Atualizar docente"):
             exec_sql("""
               INSERT INTO professors(name,email,role,pin,approved)
               VALUES(:n,:e,:r,:p,1)
               ON CONFLICT(email) DO UPDATE SET name=:n, role=:r, pin=:p, approved=1
-            """, n=name, e=email.lower().strip(), r=role, p=pin)
+            """, n=pname, e=pemail.lower().strip(), r=prole, p=ppin)
             st.success("Docente salvo.")
             st.experimental_rerun()
 
-# 10.5) ALUNOS & DOCENTES (importações)
+# ----- 5) Alunos & Docentes (docente)
 with tabs[4]:
     if not can_access("docente"):
         st.info("Acesso restrito a docentes.")
@@ -717,16 +668,17 @@ with tabs[4]:
             st.success(f"{len(df)} aluno(s) processados.")
 
         st.markdown("---")
-        st.subheader("Solicitar cadastro manual (aluno)")
-        ra  = st.text_input("RA do aluno")
+        st.subheader("Cadastro manual de aluno")
+        ra  = st.text_input("RA")
         nm  = st.text_input("Nome")
         em  = st.text_input("E-mail")
         tm  = st.text_input("Turma", value="MA6")
         if st.button("Cadastrar aluno"):
             try:
                 exec_sql("""
-                  INSERT OR IGNORE INTO students(ra,name,email,turma,active)
+                  INSERT INTO students(ra,name,email,turma,active)
                   VALUES(:ra,:n,:e,:t,1)
+                  ON CONFLICT(ra) DO UPDATE SET name=:n, email=:e, turma=:t, active=1
                 """, ra=ra.strip(), n=nm.strip(), e=em.strip().lower(), t=tm.strip().upper())
                 st.success("Aluno cadastrado/atualizado.")
             except Exception as e:
