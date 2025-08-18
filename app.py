@@ -1,9 +1,10 @@
-# app.py
-import os, json, urllib
+# app.py – MVP Submissões Industrial & EBC II (2025/2)
+import os, io, re, json, urllib
 from datetime import datetime
 from typing import Optional
 
 import streamlit as st
+import pandas as pd
 import requests
 
 # PDFs (opcional)
@@ -16,13 +17,15 @@ except ImportError:
 # Banco via SQLAlchemy (SQLite)
 # ----------------------------
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Boolean, ForeignKey, Text
+    create_engine, Column, Integer, String, Boolean, ForeignKey, Text, UniqueConstraint
 )
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 
 DB_PATH = os.path.join(os.getcwd(), "submissions_app.db")
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 Base = declarative_base()
+Session = sessionmaker(bind=engine)
+session = Session()
 
 # ---------- MODELOS ----------
 class Discipline(Base):
@@ -118,9 +121,15 @@ class Submission(Base):
     files = Column(Text, nullable=False)        # JSON: {"termo":"...", "relatorio":"...", "slides":"...", "video":"...", "_meta":{...}}
     group = relationship("Group")
 
+class Theme(Base):
+    __tablename__ = 'themes'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String, nullable=False)        # título único
+    category = Column(String, nullable=True)      # opcional (Privatização, Concessão, PPP, etc.)
+    active = Column(Boolean, default=True)
+    __table_args__ = (UniqueConstraint('title', name='_uq_theme_title'),)
+
 Base.metadata.create_all(engine)
-Session = sessionmaker(bind=engine)
-session = Session()
 
 # ----------------------------
 # Seeds mínimos (disciplinas)
@@ -155,6 +164,40 @@ ensure_admin()
 # ---------------------------------
 st.set_page_config(page_title="Submissões – Industrial & EBC II (2025/2)", layout="wide")
 
+# ---- Modo Galeria Pública (sem login) ----
+if st.query_params.get("public", ["0"])[0] == "1":
+    st.title("Galeria Pública – Trabalhos")
+    groups = session.query(Group).all()
+    pubs = [g for g in groups if (g.industrial_approved or g.ebc_approved)]
+    if not pubs:
+        st.info("Ainda não há trabalhos publicados.")
+    else:
+        for g in sorted(pubs, key=lambda x: x.name):
+            st.subheader(f"{g.name} — {g.theme}")
+            subs = session.query(Submission).filter_by(group_id=g.id).order_by(Submission.id.desc()).all()
+            if not subs:
+                st.caption("Sem arquivos publicados.")
+                continue
+            latest = subs[0]
+            files = json.loads(latest.files)
+            # vídeo primeiro
+            v = files.get("video")
+            if v:
+                p = os.path.join("uploads", f"group_{g.id}", latest.timestamp, v)
+                if os.path.exists(p):
+                    with open(p, "rb") as f: st.video(f.read())
+            # demais
+            for lbl, fn in files.items():
+                if lbl in ("_meta","video"): continue
+                p = os.path.join("uploads", f"group_{g.id}", latest.timestamp, fn)
+                if os.path.exists(p):
+                    with open(p, "rb") as f:
+                        st.download_button(f"Baixar {lbl.capitalize()} ({fn})", data=f.read(), file_name=fn, key=f"pub_{g.id}_{lbl}")
+    st.stop()
+
+# ---------------------------------
+# Estado de sessão (login)
+# ---------------------------------
 if 'user_id' not in st.session_state:
     st.session_state.user_id = None
     st.session_state.user_role = None   # 'student' ou 'teacher'
@@ -173,8 +216,9 @@ if st.session_state.user_id is None and DEV_QUICK_LOGIN:
 # Login
 if st.session_state.user_id is None:
     st.title("Login – Submissões (Industrial & EBC II)")
-    login_email = st.text_input("E-mail institucional").strip().lower()
+    login_email = st.text_input("E-mail institucional (ex.: ra123456@pucsp.edu.br)").strip().lower()
     login_pass  = st.text_input("Senha", type="password")
+    st.caption("Alunos: use seu e-mail institucional; senha inicial = **RA** (se o docente não alterar). Docentes: senha definida no cadastro.")
     if st.button("Entrar"):
         # docente?
         user = session.query(Teacher).filter(
@@ -212,12 +256,145 @@ if st.sidebar.button("Sair"):
     st.rerun()
 
 # ---------------------------
+# Helpers utilitários
+# ---------------------------
+DISC_MAP = {
+    "IND": "Economia Industrial",
+    "EBC II": "Economia Brasileira Contemporânea II",
+    "EBC": "Economia Brasileira Contemporânea II",
+}
+
+def parse_filemeta(fname: str):
+    """
+    Extrai (turma, disciplina_label, docente_nome) do nome do arquivo.
+    Ex.: '250817 NB6 EBC II  Julio.xls'
+    """
+    base = os.path.splitext(os.path.basename(fname))[0]
+    parts = base.split()
+    turma = None
+    for p in parts:
+        if re.fullmatch(r"[A-Z]{2}6", p.upper()):
+            turma = p.upper()
+            break
+    joined = " ".join(parts).upper()
+    disc_token = None
+    if "EBC II" in joined:
+        disc_token = "EBC II"
+    elif re.search(r"\bIND\b", joined):
+        disc_token = "IND"
+    elif re.search(r"\bEBC\b", joined):
+        disc_token = "EBC"
+    docente = None
+    if disc_token:
+        pos = joined.find(disc_token)
+        docente_raw = base[pos + len(disc_token):].strip()
+        docente_raw = re.sub(r"\s+", " ", docente_raw).strip()
+        docente = docente_raw if docente_raw else None
+    else:
+        tail = []
+        for p in parts[::-1]:
+            if re.fullmatch(r"[A-Z]{2}6", p.upper()):
+                break
+            if re.fullmatch(r"\d{6,}", p):
+                continue
+            tail.append(p)
+        if tail:
+            docente = " ".join(tail[::-1])
+    disc_label = DISC_MAP.get(disc_token or "", None)
+    return turma, disc_label, docente
+
+def get_or_create_teacher(session, nome: str, email_guess: str = "") -> Teacher:
+    email_norm = (email_guess or "").strip().lower()
+    if not email_norm and nome:
+        slug = re.sub(r"[^a-z0-9]+", ".", (nome or "").lower()).strip(".")
+        email_norm = f"{slug}@pucsp.edu.br"
+    if not email_norm:
+        email_norm = "docente@pucsp.edu.br"
+    t = session.query(Teacher).filter(Teacher.email == email_norm).first()
+    if not t:
+        t = Teacher(name=(nome or email_norm.split("@")[0].title()).strip(),
+                    email=email_norm, password="1234")
+        session.add(t); session.commit()
+    return t
+
+def get_or_create_offering(session, disc_label: str, turma: str, teacher: Optional[Teacher]) -> Offering:
+    disc = session.query(Discipline).filter(Discipline.name == disc_label).first()
+    if not disc:
+        disc = Discipline(name=disc_label); session.add(disc); session.commit()
+    off = session.query(Offering).filter_by(name=turma, discipline_id=disc.id).first()
+    if not off:
+        off = Offering(name=turma, discipline_id=disc.id, teacher_id=teacher.id if teacher else None)
+        session.add(off); session.commit()
+    else:
+        if teacher and off.teacher_id != teacher.id:
+            off.teacher_id = teacher.id
+            session.commit()
+    return off
+
+def import_students_df(session, df: pd.DataFrame, offering: Offering, is_industrial: bool):
+    cols = {c.lower().strip(): c for c in df.columns}
+    def pick(*opts):
+        for o in opts:
+            if o in cols: return cols[o]
+        return None
+    c_name = pick("name","nome","aluno")
+    c_ra   = pick("ra","registro","matricula","mtr","rm")
+    c_email= pick("email","e-mail")
+    if not c_name or not c_ra:
+        raise ValueError("A planilha precisa conter ao menos as colunas 'name'/'nome' e 'ra'.")
+    created = updated = 0
+    for _, row in df.iterrows():
+        name = str(row[c_name]).strip()
+        ra   = str(row[c_ra]).strip()
+        email = str(row[c_email]).strip().lower() if c_email else ""
+        if not name or not ra:
+            continue
+        if not email:
+            email = f"{ra}@pucsp.edu.br"
+        email = email.lower()
+        stu = session.query(Student).filter_by(email=email).first()
+        if not stu:
+            stu = Student(
+                name=name, email=email, ra=ra or None, password=(ra or "1234"),
+                industrial_class_id=offering.id if is_industrial else None,
+                ebc_class_id=offering.id if not is_industrial else None
+            )
+            session.add(stu); session.commit()
+            created += 1
+        else:
+            stu.name = name
+            if ra: stu.ra = ra
+            if is_industrial:
+                stu.industrial_class_id = offering.id
+            else:
+                stu.ebc_class_id = offering.id
+            session.commit()
+            updated += 1
+    return created, updated
+
+def _xlsx_bytes_from_df(df: pd.DataFrame) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
+        df.to_excel(xw, index=False, sheet_name="Sheet1")
+    return bio.getvalue()
+
+def make_students_template() -> bytes:
+    df = pd.DataFrame([{"name": "NOME COMPLETO", "ra": "RA123456", "email": "RA123456@pucsp.edu.br"}])
+    return _xlsx_bytes_from_df(df)
+
+def make_themes_template() -> bytes:
+    df = pd.DataFrame([
+        {"title": "Privatização da Telebras e o impacto na concorrência e preços", "category": "Privatização", "active": True}
+    ])
+    return _xlsx_bytes_from_df(df)
+
+# ---------------------------
 # Abas por papel do usuário
 # ---------------------------
 if st.session_state.user_role == 'student':
     tabs = st.tabs(["Grupos & Temas", "Upload"])
 else:
-    tabs = st.tabs(["Grupos & Temas", "Upload", "Avaliação", "Relatórios", "Admin (Students)"])
+    tabs = st.tabs(["Grupos & Temas", "Upload", "Avaliação", "Relatórios", "Admin (Students)", "Temas (Gestão)"])
 
 # ---------------------------
 # Tab 1 – Grupos & Temas
@@ -225,7 +402,6 @@ else:
 with tabs[0]:
     st.header("Grupos & Temas (sem duplicidade de tema)")
     if st.session_state.user_role == 'student':
-        # Já está em grupo?
         membership = session.query(GroupMember).filter_by(student_id=current_user.id).first()
         if membership:
             grp = session.query(Group).get(membership.group_id)
@@ -248,7 +424,7 @@ with tabs[0]:
             joinables = []
             for g in groups:
                 n = len(g.members_assoc)
-                if n < 5:  # até 5 alunos (ajuste aqui se desejar 6)
+                if n < 5:  # até 5 alunos (ajuste se quiser 6)
                     joinables.append(f"{g.name} | {g.theme} ({n}/5)")
             if joinables:
                 choice = st.selectbox("Escolha um grupo para entrar:", [""] + joinables, index=0)
@@ -268,20 +444,25 @@ with tabs[0]:
 
             st.markdown("---")
             st.subheader("Criar novo grupo")
-            new_theme = st.text_input("Tema (sem duplicidade; será bloqueado ao primeiro grupo que escolher):")
+            # lista de temas ativos (opcional)
+            theme_records = session.query(Theme).filter(Theme.active == True).order_by(Theme.title.asc()).all()
+            use_catalog = st.checkbox("Escolher tema do catálogo", value=True)
+            new_theme = None
+            if use_catalog and theme_records:
+                titles = [t.title for t in theme_records]
+                new_theme = st.selectbox("Tema (catálogo)", titles)
+            else:
+                new_theme = st.text_input("Tema (livre, sem duplicidade)")
             if st.button("Criar Grupo"):
-                if not new_theme.strip():
+                if not (new_theme or "").strip():
                     st.error("Informe um tema.")
                 else:
-                    # Sem duplicidade (mesmo título – case-insensitive)
                     same = session.query(Group).filter(Group.theme.ilike(new_theme.strip())).first()
                     if same:
                         st.error("Tema já escolhido por outro grupo.")
                     else:
-                        # turma primária = oferta do criador (prioriza Industrial, senão EBC)
                         primary_off = current_user.industrial_class or current_user.ebc_class
                         base = primary_off.name if primary_off else "GRP"
-                        # Próximo número por prefixo
                         existing = [g for g in session.query(Group).all() if g.name.startswith(f"Grupo {base}-")]
                         next_num = len(existing) + 1
                         gname = f"Grupo {base}-{next_num}"
@@ -315,11 +496,8 @@ with tabs[1]:
             grp = session.query(Group).get(membership.group_id)
             st.subheader(f"{grp.name} — {grp.theme}")
 
-            # Turmas do aluno
             ind_off = current_user.industrial_class
             ebc_off = current_user.ebc_class
-
-            # Disciplina da entrega
             disc_choices = []
             if ind_off: disc_choices.append(("Economia Industrial", "IND", ind_off))
             if ebc_off: disc_choices.append(("Economia Brasileira Contemporânea II", "EBCII", ebc_off))
@@ -333,8 +511,6 @@ with tabs[1]:
                 if lbl == disc_label:
                     disc_code, disc_off = code, off
                     break
-
-            # Turma da entrega (prefill)
             turma_default = disc_off.name if disc_off else (ind_off.name if ind_off else (ebc_off.name if ebc_off else ""))
             turma_entrega = st.text_input("Turma da entrega (ex.: MA6, MB6, NA6, NB6)", value=turma_default)
 
@@ -352,17 +528,13 @@ with tabs[1]:
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     base_dir = os.path.join("uploads", f"group_{grp.id}", timestamp)
                     os.makedirs(base_dir, exist_ok=True)
-
                     files = [("termo", terms), ("relatorio", report), ("slides", slides), ("video", video)]
                     saved = {}
-                    # salva local
                     for label, up in files:
                         path = os.path.join(base_dir, up.name)
                         with open(path, "wb") as f:
                             f.write(up.getbuffer())
                         saved[label] = up.name
-
-                    # metadados úteis da entrega
                     saved["_meta"] = {
                         "disciplina": disc_label,
                         "disciplina_code": disc_code,
@@ -373,7 +545,7 @@ with tabs[1]:
                     sp_client_id     = st.secrets.get("sp_client_id")
                     sp_client_secret = st.secrets.get("sp_client_secret")
                     sp_tenant_id     = st.secrets.get("sp_tenant_id")
-                    sp_drive_id      = st.secrets.get("sp_drive_id")  # ID do drive/biblioteca
+                    sp_drive_id      = st.secrets.get("sp_drive_id")
                     sp_folder_path   = st.secrets.get("sp_folder_path", "/Shared Documents/Submissoes_2025_2")
                     token = None
                     if sp_client_id and sp_client_secret and sp_tenant_id:
@@ -419,7 +591,6 @@ with tabs[1]:
                             except Exception as e:
                                 st.error(f"SharePoint falhou para {up.name}: {e}")
 
-                    # Grava submissão
                     sub = Submission(group_id=grp.id, timestamp=timestamp, files=json.dumps(saved, ensure_ascii=False))
                     session.add(sub); session.commit()
                     st.success("Submissão registrada. Arquivos salvos localmente e (se configurado) no SharePoint.")
@@ -430,11 +601,10 @@ with tabs[1]:
 if st.session_state.user_role == 'teacher':
     with tabs[2]:
         st.header("Avaliação de Grupos")
-        teacher_offs = current_user.offerings  # turmas do docente
+        teacher_offs = current_user.offerings
         all_groups = session.query(Group).all()
         is_admin = (getattr(current_user, "email", "").lower() == ADMIN_EMAIL.lower())
 
-        # Filtros
         class_opts = ["Todas"] + ([o.name for o in teacher_offs] if not is_admin else sorted({o.name for o in session.query(Offering).all()}))
         sel_class = st.selectbox("Turma", class_opts)
 
@@ -445,7 +615,6 @@ if st.session_state.user_role == 'teacher':
             discs = list({o.discipline.name for o in teacher_offs})
             sel_disc = st.selectbox("Disciplina", ["Todas"] + discs)
 
-        # aplica filtros
         filtered = []
         for g in all_groups:
             ok = True
@@ -488,7 +657,6 @@ if st.session_state.user_role == 'teacher':
                     t = "/".join(tags) if tags else "–"
                     st.write(f"- {stud.name} ({t})")
 
-                # histórico
                 subs = session.query(Submission).filter_by(group_id=grp.id).order_by(Submission.id.desc()).all()
                 if subs:
                     st.markdown("**Histórico de envios:**")
@@ -499,11 +667,17 @@ if st.session_state.user_role == 'teacher':
                         for lbl, fn in files.items():
                             if lbl == "_meta": continue
                             path = os.path.join("uploads", f"group_{grp.id}", when, fn)
+                            nice = {"termo":"Termo", "relatorio":"Relatório", "slides":"Slides", "video":"Vídeo"}.get(lbl,lbl)
                             if os.path.exists(path):
                                 with open(path, "rb") as f:
                                     data = f.read()
-                                nice = {"termo":"Termo", "relatorio":"Relatório", "slides":"Slides", "video":"Vídeo"}.get(lbl,lbl)
-                                st.download_button(f"Baixar {nice} ({fn})", data=data, file_name=fn, key=f"d_{s.id}_{lbl}")
+                                ext = fn.lower().split(".")[-1]
+                                if ext in ("mp4","mov","mkv","avi","mpeg"):
+                                    st.video(data)
+                                elif ext in ("mp3","wav","m4a","aac","ogg"):
+                                    st.audio(data)
+                                else:
+                                    st.download_button(f"Baixar {nice} ({fn})", data=data, file_name=fn, key=f"d_{s.id}_{lbl}")
                             else:
                                 st.write(f"- {fn} (não encontrado localmente)")
                 else:
@@ -511,7 +685,6 @@ if st.session_state.user_role == 'teacher':
 
                 st.markdown("---")
                 st.markdown("**Avaliação**")
-                # O que este docente pode avaliar? (se admin: tudo)
                 teaches_ind = is_admin or any(o.discipline_id == disc_ind.id for o in teacher_offs)
                 teaches_ebc = is_admin or any(o.discipline_id == disc_ebc.id for o in teacher_offs)
 
@@ -526,8 +699,7 @@ if st.session_state.user_role == 'teacher':
                     ebc_comment = st.text_area("Comentários – EBC II", value=grp.ebc_comment or "")
                     ebc_ok      = st.checkbox("Aprovar (EBC II)", value=bool(grp.ebc_approved))
 
-                # participação por aluno
-                st.markdown("**Participação (opcional, por integrante):**")
+                st.markdown("**Participação (por integrante, opcional):**")
                 part_inputs = {}
                 for gm in grp.members_assoc:
                     lab = f"{gm.student.name}"
@@ -535,15 +707,15 @@ if st.session_state.user_role == 'teacher':
 
                 if st.button("Salvar avaliação"):
                     if teaches_ind:
-                        grp.industrial_grade = ind_grade.strip() if ind_grade else None
-                        grp.industrial_comment = ind_comment.strip() if ind_comment else None
+                        grp.industrial_grade = (ind_grade or "").strip() or None
+                        grp.industrial_comment = (ind_comment or "").strip() or None
                         grp.industrial_approved = bool(ind_ok)
                     if teaches_ebc:
-                        grp.ebc_grade = ebc_grade.strip() if ebc_grade else None
-                        grp.ebc_comment = ebc_comment.strip() if ebc_comment else None
+                        grp.ebc_grade = (ebc_grade or "").strip() or None
+                        grp.ebc_comment = (ebc_comment or "").strip() or None
                         grp.ebc_approved = bool(ebc_ok)
                     for gm in grp.members_assoc:
-                        gm.participation = part_inputs.get(gm.id, "").strip() or None
+                        gm.participation = (part_inputs.get(gm.id, "") or "").strip() or None
                     session.commit()
                     st.success("Avaliação salva.")
                     st.rerun()
@@ -679,8 +851,8 @@ if st.session_state.user_role == 'teacher':
     with tabs[4]:
         st.header("Admin (Students)")
         st.info(
-            "Faça upload de um CSV por turma. Formato mínimo: "
-            "**name,ra[,email]**. Se o email vier vazio, uso **RA@pucsp.edu.br**.\n\n"
+            "Faça upload de um **CSV** por turma. Formato mínimo: "
+            "**name, ra, email(opcional)**. Se o email vier vazio, uso **RA@pucsp.edu.br**.\n\n"
             "Selecione abaixo a **Disciplina** e a **Turma** que este arquivo representa."
         )
 
@@ -688,86 +860,248 @@ if st.session_state.user_role == 'teacher':
             "Economia Industrial": disc_ind,
             "Economia Brasileira Contemporânea II": disc_ebc,
         }
-        sel_disc_label = st.selectbox("Disciplina deste CSV", list(disc_label_to_obj.keys()))
+        sel_disc_label = st.selectbox("Disciplina deste CSV/XLSX", list(disc_label_to_obj.keys()))
         sel_disc = disc_label_to_obj[sel_disc_label]
         sel_turma = st.text_input("Turma (ex.: MA6, MB6, NA6, NB6)")
 
-        up = st.file_uploader("CSV (colunas: name,ra[,email])", type=["csv"])
-
+        up = st.file_uploader("CSV (colunas: name, ra, email)", type=["csv"])
         if up and st.button("Processar CSV desta turma"):
             try:
-                import pandas as pd
                 if not sel_turma.strip():
                     st.error("Informe a turma.")
                     st.stop()
-
-                # garante oferta (Offering) da disciplina/turma
                 off = session.query(Offering).filter_by(name=sel_turma.strip(), discipline_id=sel_disc.id).first()
                 if not off:
                     off = Offering(name=sel_turma.strip(), discipline_id=sel_disc.id, teacher_id=None)
                     session.add(off); session.commit()
-
                 df = pd.read_csv(up).fillna("")
+                is_ind = (sel_disc.id == disc_ind.id)
                 created = updated = 0
-                for _, row in df.iterrows():
-                    name = str(row.get("name","")).strip()
-                    ra   = str(row.get("ra","")).strip()
-                    email_raw = str(row.get("email","")).strip().lower()
-                    if not name or not ra:
-                        continue
-                    email = (email_raw if email_raw else f"{ra}@pucsp.edu.br").lower()
-
-                    stu = session.query(Student).filter_by(email=email).first()
-                    if not stu:
-                        # senha inicial = RA (ou '1234' se vazio)
-                        password = ra if ra else "1234"
-                        stu = Student(
-                            name=name, email=email, ra=ra or None, password=password,
-                            industrial_class_id=off.id if sel_disc.id == disc_ind.id else None,
-                            ebc_class_id=off.id if sel_disc.id == disc_ebc.id else None
-                        )
-                        session.add(stu); session.commit()
-                        created += 1
-                    else:
-                        # atualiza nome/RA e matricula na oferta correspondente
-                        stu.name = name
-                        if ra: stu.ra = ra
-                        if sel_disc.id == disc_ind.id:
-                            stu.industrial_class_id = off.id
+                cols = {c.lower().strip(): c for c in df.columns}
+                def getc(*opts):
+                    for o in opts:
+                        if o in cols: return cols[o]
+                    return None
+                c_name = getc("name","nome","aluno")
+                c_ra   = getc("ra","registro","matricula","rm","mtr")
+                c_email= getc("email","e-mail")
+                if not c_name or not c_ra:
+                    st.error("A planilha deve conter ao menos as colunas 'name' e 'ra'.")
+                else:
+                    for _, row in df.iterrows():
+                        name = str(row[c_name]).strip()
+                        ra   = str(row[c_ra]).strip()
+                        email_raw = (str(row[c_email]).strip().lower() if c_email else "")
+                        if not name or not ra:
+                            continue
+                        email = (email_raw if email_raw else f"{ra}@pucsp.edu.br").lower()
+                        stu = session.query(Student).filter_by(email=email).first()
+                        if not stu:
+                            stu = Student(
+                                name=name, email=email, ra=ra or None, password=(ra or "1234"),
+                                industrial_class_id=off.id if is_ind else None,
+                                ebc_class_id=off.id if not is_ind else None
+                            )
+                            session.add(stu); session.commit()
+                            created += 1
                         else:
-                            stu.ebc_class_id = off.id
-                        session.commit()
-                        updated += 1
-
-                st.success(f"Processado: {created} criados, {updated} atualizados para {sel_disc_label} – {sel_turma}.")
+                            stu.name = name
+                            if ra: stu.ra = ra
+                            if is_ind: stu.industrial_class_id = off.id
+                            else:      stu.ebc_class_id = off.id
+                            session.commit(); updated += 1
+                    st.success(f"Processado: {created} criados, {updated} atualizados para {sel_disc_label} – {sel_turma}.")
             except Exception as e:
                 st.error(f"Falha ao importar CSV: {e}")
 
         st.markdown("---")
-        st.subheader("Vincular docentes às turmas (ofertas)")
-        offs = session.query(Offering).all()
-        if offs:
-            # lista simples para escolher oferta e docente
-            off_names = [f"{o.name} – {o.discipline.name}" for o in offs]
-            sel = st.selectbox("Oferta", [""] + off_names)
-            teachers = session.query(Teacher).all()
-            t_names = [f"{t.name} <{t.email}>" for t in teachers]
-            sel_t = st.selectbox("Docente", [""] + t_names)
-            if st.button("Salvar vínculo"):
-                try:
-                    if sel and sel_t:
-                        o_name = sel.split(" – ")[0]
-                        o = session.query(Offering).filter_by(name=o_name).first()
-                        t_email = sel_t.split("<")[-1].rstrip(">").lower()
-                        t = session.query(Teacher).filter_by(email=t_email).first()
-                        o.teacher_id = t.id
-                        session.commit()
-                        st.success("Vínculo atualizado.")
+        st.markdown("### Templates XLSX")
+        colx1, colx2 = st.columns(2)
+        if colx1.download_button("Baixar template de ALUNOS (XLSX)", data=make_students_template(), file_name="template_alunos.xlsx"):
+            pass
+        if colx2.download_button("Baixar template de TEMAS (XLSX)", data=make_themes_template(), file_name="template_temas.xlsx"):
+            pass
+
+        st.markdown("---")
+        st.markdown("### Importar ALUNOS (XLSX)")
+        up_xlsx_students = st.file_uploader("Planilha de alunos (.xlsx) — colunas: name, ra, email (opcional)", type=["xlsx"], key="xlsx_students")
+        if up_xlsx_students and st.button("Processar XLSX de alunos"):
+            try:
+                if not sel_turma.strip():
+                    st.error("Informe a turma acima antes de importar.")
+                else:
+                    off = session.query(Offering).filter_by(name=sel_turma.strip(), discipline_id=sel_disc.id).first()
+                    if not off:
+                        off = Offering(name=sel_turma.strip(), discipline_id=sel_disc.id, teacher_id=None)
+                        session.add(off); session.commit()
+                    is_ind = (sel_disc.id == disc_ind.id)
+                    df = pd.read_excel(up_xlsx_students).fillna("")
+                    created = updated = 0
+                    cols = {c.lower().strip(): c for c in df.columns}
+                    def getc(*opts):
+                        for o in opts:
+                            if o in cols: return cols[o]
+                        return None
+                    c_name = getc("name","nome","aluno")
+                    c_ra   = getc("ra","registro","matricula","rm","mtr")
+                    c_email= getc("email","e-mail")
+                    if not c_name or not c_ra:
+                        st.error("A planilha deve conter ao menos as colunas 'name' e 'ra'.")
                     else:
-                        st.warning("Selecione oferta e docente.")
+                        for _, row in df.iterrows():
+                            name = str(row[c_name]).strip()
+                            ra   = str(row[c_ra]).strip()
+                            email_raw = (str(row[c_email]).strip().lower() if c_email else "")
+                            if not name or not ra:
+                                continue
+                            email = (email_raw if email_raw else f"{ra}@pucsp.edu.br").lower()
+                            stu = session.query(Student).filter_by(email=email).first()
+                            if not stu:
+                                stu = Student(
+                                    name=name, email=email, ra=ra or None, password=(ra or "1234"),
+                                    industrial_class_id=off.id if is_ind else None,
+                                    ebc_class_id=off.id if not is_ind else None
+                                )
+                                session.add(stu); session.commit()
+                                created += 1
+                            else:
+                                stu.name = name
+                                if ra: stu.ra = ra
+                                if is_ind: stu.industrial_class_id = off.id
+                                else:      stu.ebc_class_id = off.id
+                                session.commit(); updated += 1
+                        st.success(f"Alunos: {created} criado(s), {updated} atualizado(s).")
+            except Exception as e:
+                st.error(f"Erro ao processar XLSX de alunos: {e}")
+
+        st.markdown("---")
+        st.markdown("### Importar planilhas Excel por nome do arquivo (.xls/.xlsx)")
+        st.caption("O nome do arquivo deve conter: <TURMA> <IND|EBC II> <NOME DO DOCENTE>. Ex.: '250816 NA6 IND Roland.xls'.")
+        xls_files = st.file_uploader("Selecione uma ou mais planilhas", type=["xls","xlsx"], accept_multiple_files=True, key="xls_uploader")
+        if xls_files and st.button("Processar planilhas (.xls/.xlsx)"):
+            total_created = total_updated = 0
+            log_lines = []
+            for upl in xls_files:
+                try:
+                    turma, disc_label, docente_nome = parse_filemeta(upl.name)
+                    if not turma or not disc_label:
+                        log_lines.append(f"❗ {upl.name}: não consegui inferir turma/disciplina.")
+                        continue
+                    teacher = get_or_create_teacher(session, docente_nome or "", "")
+                    off = get_or_create_offering(session, disc_label, turma, teacher)
+                    is_ind = (disc_label == "Economia Industrial")
+                    df = pd.read_excel(upl).fillna("")
+                    c,u = import_students_df(session, df, off, is_ind)
+                    total_created += c; total_updated += u
+                    log_lines.append(f"✅ {upl.name}: {turma} | {disc_label} | Docente: {teacher.name} — {c} criados, {u} atualizados.")
                 except Exception as e:
-                    st.error(f"Erro: {e}")
+                    log_lines.append(f"❌ {upl.name}: erro ao processar: {e}")
+            st.success(f"Concluído. Criados: {total_created}, Atualizados: {total_updated}")
+            st.text("\n".join(log_lines))
+
+        st.markdown("---")
+        st.markdown("### Editar ALUNO individualmente")
+        email_lookup = st.text_input("E-mail do aluno (case-insensitive)").strip().lower()
+        if st.button("Carregar aluno"):
+            stu = session.query(Student).filter(Student.email == email_lookup).first()
+            if not stu:
+                st.error("Aluno não encontrado.")
+            else:
+                st.session_state["_edit_stu_id"] = stu.id
+        if st.session_state.get("_edit_stu_id"):
+            stu = session.query(Student).get(st.session_state["_edit_stu_id"])
+            new_name = st.text_input("Nome", value=stu.name)
+            new_ra   = st.text_input("RA", value=stu.ra or "")
+            offs_ind = session.query(Offering).filter_by(discipline_id=disc_ind.id).all()
+            offs_ebc = session.query(Offering).filter_by(discipline_id=disc_ebc.id).all()
+            opt_ind = ["(sem)"] + [o.name for o in offs_ind]
+            opt_ebc = ["(sem)"] + [o.name for o in offs_ebc]
+            idx_ind = 0
+            if stu.industrial_class: 
+                try: idx_ind = opt_ind.index(stu.industrial_class.name)
+                except: idx_ind = 0
+            idx_ebc = 0
+            if stu.ebc_class:
+                try: idx_ebc = opt_ebc.index(stu.ebc_class.name)
+                except: idx_ebc = 0
+            sel_ind = st.selectbox("Turma IND", opt_ind, index = idx_ind)
+            sel_ebc = st.selectbox("Turma EBC II", opt_ebc, index = idx_ebc)
+            if st.button("Salvar aluno"):
+                stu.name = new_name.strip()
+                stu.ra   = new_ra.strip() or None
+                if sel_ind == "(sem)":
+                    stu.industrial_class_id = None
+                else:
+                    o = session.query(Offering).filter_by(name=sel_ind, discipline_id=disc_ind.id).first()
+                    if o: stu.industrial_class_id = o.id
+                if sel_ebc == "(sem)":
+                    stu.ebc_class_id = None
+                else:
+                    o = session.query(Offering).filter_by(name=sel_ebc, discipline_id=disc_ebc.id).first()
+                    if o: stu.ebc_class_id = o.id
+                session.commit()
+                st.success("Aluno atualizado.")
+
+# ---------------------------
+# Tab 6 – Temas (Gestão)
+# ---------------------------
+if st.session_state.user_role == 'teacher':
+    with tabs[5]:
+        st.header("Gestão de Temas")
+        st.caption("Catálogo de temas (sem duplicidade). Recomenda-se que grupos usem a lista ativa.")
+        up_themes = st.file_uploader("Importar TEMAS (XLSX) — colunas: title, category, active", type=["xlsx"])
+        if up_themes and st.button("Processar XLSX de TEMAS"):
+            try:
+                df = pd.read_excel(up_themes).fillna("")
+                cols = {c.lower().strip(): c for c in df.columns}
+                c_title = cols.get("title"); c_cat = cols.get("category"); c_active = cols.get("active")
+                if not c_title:
+                    st.error("A planilha precisa ter a coluna 'title'.")
+                else:
+                    added = updated = 0
+                    for _, row in df.iterrows():
+                        title = str(row[c_title]).strip()
+                        if not title: continue
+                        cat   = str(row[c_cat]).strip() if c_cat else None
+                        act   = row[c_active] if c_active else True
+                        if isinstance(act, str): act = act.strip().lower() in ("1","true","sim","yes","y")
+                        t = session.query(Theme).filter(Theme.title.ilike(title)).first()
+                        if not t:
+                            t = Theme(title=title, category=cat or None, active=bool(act))
+                            session.add(t); session.commit(); added += 1
+                        else:
+                            t.category = cat or None
+                            t.active   = bool(act)
+                            session.commit(); updated += 1
+                    st.success(f"Temas: {added} adicionados, {updated} atualizados.")
+            except Exception as e:
+                st.error(f"Erro ao processar XLSX de temas: {e}")
+
+        st.markdown("---")
+        st.subheader("Temas cadastrados")
+        q = session.query(Theme).order_by(Theme.active.desc(), Theme.title.asc()).all()
+        if not q:
+            st.info("Nenhum tema cadastrado.")
         else:
-            st.info("Sem ofertas cadastradas ainda. Importe alunos primeiro para criar ofertas automaticamente.")
+            for t in q:
+                with st.expander(f"{'✅' if t.active else '🚫'} {t.title}"):
+                    new_title = st.text_input("Título", value=t.title, key=f"tt_{t.id}")
+                    new_cat   = st.text_input("Categoria", value=t.category or "", key=f"tc_{t.id}")
+                    new_act   = st.checkbox("Ativo", value=bool(t.active), key=f"ta_{t.id}")
+                    colu, cold = st.columns(2)
+                    if colu.button("Salvar", key=f"tup_{t.id}"):
+                        other = session.query(Theme).filter(Theme.title.ilike(new_title), Theme.id != t.id).first()
+                        if other:
+                            st.error("Já existe outro tema com esse título.")
+                        else:
+                            t.title = new_title.strip()
+                            t.category = new_cat.strip() or None
+                            t.active = bool(new_act)
+                            session.commit()
+                            st.success("Tema atualizado.")
+                    if cold.button("Excluir", key=f"tdel_{t.id}"):
+                        session.delete(t); session.commit()
+                        st.warning("Tema excluído.")
+                        st.rerun()
 
 st.caption("MVP – Submissões Industrial & EBC II (2025/2)")
