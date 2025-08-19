@@ -1,4 +1,4 @@
-# app.py – MVP Submissões Industrial & EBC II (2025/2)
+# app.py – MVP Submissões Industrial & EBC II (2025/2) – consolidado
 import os, io, re, json, urllib
 from datetime import datetime
 from typing import Optional
@@ -17,7 +17,7 @@ except ImportError:
 # Banco via SQLAlchemy (SQLite)
 # ----------------------------
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Boolean, ForeignKey, Text, UniqueConstraint
+    create_engine, Column, Integer, String, Boolean, ForeignKey, Text, UniqueConstraint, inspect
 )
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 
@@ -77,6 +77,11 @@ class Group(Base):
     theme = Column(String, nullable=False)     # sem duplicidade (app garante)
     primary_offering_id = Column(Integer, ForeignKey('offerings.id'))
     primary_offering = relationship("Offering")
+
+    # NOVOS CAMPOS
+    allow_six = Column(Boolean, default=False)        # permite 6º aluno, se docente autorizar
+    publish_public = Column(Boolean, default=False)   # publicar na galeria pública
+
     # Avaliação (por UC)
     industrial_grade = Column(String)
     ebc_grade = Column(String)
@@ -118,7 +123,7 @@ class Submission(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     group_id = Column(Integer, ForeignKey('groups.id'), nullable=False)
     timestamp = Column(String, nullable=False)  # "20250817_103501"
-    files = Column(Text, nullable=False)        # JSON: {"termo":"...", "relatorio":"...", "slides":"...", "video":"...", "_meta":{...}}
+    files = Column(Text, nullable=False)        # JSON: {"termo":0/1, "relatorio":"...", "slides":"...", "video_file":"...", "_meta":{...}, "_by":"email"}
     group = relationship("Group")
 
 class Theme(Base):
@@ -130,6 +135,21 @@ class Theme(Base):
     __table_args__ = (UniqueConstraint('title', name='_uq_theme_title'),)
 
 Base.metadata.create_all(engine)
+
+# --- MIGRAÇÃO SIMPLES: novas colunas allow_six, publish_public (se não existirem) ---
+with engine.connect() as conn:
+    insp = inspect(conn)
+    cols = [c['name'] for c in insp.get_columns('groups')]
+    if 'allow_six' not in cols:
+        try:
+            conn.exec_driver_sql("ALTER TABLE groups ADD COLUMN allow_six INTEGER DEFAULT 0")
+        except Exception:
+            pass
+    if 'publish_public' not in cols:
+        try:
+            conn.exec_driver_sql("ALTER TABLE groups ADD COLUMN publish_public INTEGER DEFAULT 0")
+        except Exception:
+            pass
 
 # ----------------------------
 # Seeds mínimos (disciplinas)
@@ -147,7 +167,7 @@ disc_ebc = session.query(Discipline).filter(Discipline.name.like("%Brasileira%")
 # ------------------------------------------------
 # Admin de testes + pulo de login (via secrets)
 # ------------------------------------------------
-ADMIN_EMAIL = (st.secrets.get("ADMIN_EMAIL", "rsaldanha@pucsp.br") or "").lower()
+ADMIN_EMAIL = (st.secrets.get("ADMIN_EMAIL", "rsaldanha@pucsp.edu.br") or "").lower()
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "8722")
 DEV_QUICK_LOGIN = bool(st.secrets.get("DEV_QUICK_LOGIN", False))
 
@@ -160,47 +180,56 @@ def ensure_admin():
 ensure_admin()
 
 # ---------------------------------
-# Config UI
+# UI / GALERIA PÚBLICA
 # ---------------------------------
 st.set_page_config(page_title="Submissões – Industrial & EBC II (2025/2)", layout="wide")
 
-# ---- Modo Galeria Pública (sem login) ----
+# --- Galeria pública (sem login) ---
 if st.query_params.get("public", ["0"])[0] == "1":
-    st.title("Galeria Pública – Trabalhos")
-    groups = session.query(Group).all()
-    pubs = [g for g in groups if (g.industrial_approved or g.ebc_approved)]
+    st.title("Galeria Pública – Trabalhos (IND + EBC II)")
+    search = st.text_input("Buscar por tema ou integrante")
+    pubs = session.query(Group).filter(Group.publish_public == True).order_by(Group.name.asc()).all()
+    if search:
+        s = search.strip().lower()
+        def match(g):
+            if s in (g.theme or "").lower(): return True
+            for gm in g.members_assoc:
+                if s in (gm.student.name or "").lower(): return True
+            return False
+        pubs = [g for g in pubs if match(g)]
     if not pubs:
         st.info("Ainda não há trabalhos publicados.")
-    else:
-        for g in sorted(pubs, key=lambda x: x.name):
-            st.subheader(f"{g.name} — {g.theme}")
-            subs = session.query(Submission).filter_by(group_id=g.id).order_by(Submission.id.desc()).all()
-            if not subs:
-                st.caption("Sem arquivos publicados.")
-                continue
-            latest = subs[0]
-            files = json.loads(latest.files)
-            # vídeo primeiro
-            v = files.get("video")
-            if v:
-                p = os.path.join("uploads", f"group_{g.id}", latest.timestamp, v)
-                if os.path.exists(p):
-                    with open(p, "rb") as f: st.video(f.read())
-            # demais
+        st.stop()
+    for g in pubs:
+        st.markdown(f"### {g.name} — *{g.theme}*")
+        names = ", ".join(sorted([gm.student.name for gm in g.members_assoc]))
+        st.caption(f"Integrantes: {names if names else '—'}")
+        sub = session.query(Submission).filter_by(group_id=g.id).order_by(Submission.id.desc()).first()
+        if sub:
+            files = json.loads(sub.files)
+            meta = files.get("_meta", {})
+            video_url = meta.get("video_url", "")
+            if video_url:
+                st.write(f"🎬 Vídeo: {video_url}")
+                if "youtube.com" in video_url or "youtu.be" in video_url:
+                    st.video(video_url)
+            # botões de download dos anexos
             for lbl, fn in files.items():
-                if lbl in ("_meta","video"): continue
-                p = os.path.join("uploads", f"group_{g.id}", latest.timestamp, fn)
+                if lbl in ("_meta","_by","termo","video_file"): 
+                    continue
+                p = os.path.join("uploads", f"group_{g.id}", sub.timestamp, fn)
                 if os.path.exists(p):
                     with open(p, "rb") as f:
                         st.download_button(f"Baixar {lbl.capitalize()} ({fn})", data=f.read(), file_name=fn, key=f"pub_{g.id}_{lbl}")
+        st.markdown("---")
     st.stop()
 
 # ---------------------------------
-# Estado de sessão (login)
+# Sessão (login)
 # ---------------------------------
 if 'user_id' not in st.session_state:
     st.session_state.user_id = None
-    st.session_state.user_role = None   # 'student' ou 'teacher'
+    st.session_state.user_role = None
     st.session_state.user_name = None
 
 # Quick login (para testes)
@@ -220,14 +249,12 @@ if st.session_state.user_id is None:
     login_pass  = st.text_input("Senha", type="password")
     st.caption("Alunos: use seu e-mail institucional; senha inicial = **RA** (se o docente não alterar). Docentes: senha definida no cadastro.")
     if st.button("Entrar"):
-        # docente?
         user = session.query(Teacher).filter(
             Teacher.email == login_email,
             Teacher.password == login_pass
         ).first()
         role = 'teacher'
         if user is None:
-            # aluno?
             user = session.query(Student).filter(
                 Student.email == login_email,
                 Student.password == login_pass
@@ -248,7 +275,6 @@ if st.session_state.user_role == 'teacher':
 else:
     current_user = session.query(Student).get(st.session_state.user_id)
 
-# Sidebar
 st.sidebar.write(f"**Usuário:** {st.session_state.user_name} ({'Docente/Admin' if st.session_state.user_role=='teacher' else 'Aluno'})")
 if st.sidebar.button("Sair"):
     for k in list(st.session_state.keys()):
@@ -265,41 +291,23 @@ DISC_MAP = {
 }
 
 def parse_filemeta(fname: str):
-    """
-    Extrai (turma, disciplina_label, docente_nome) do nome do arquivo.
-    Ex.: '250817 NB6 EBC II  Julio.xls'
-    """
     base = os.path.splitext(os.path.basename(fname))[0]
     parts = base.split()
     turma = None
     for p in parts:
         if re.fullmatch(r"[A-Z]{2}6", p.upper()):
-            turma = p.upper()
-            break
+            turma = p.upper(); break
     joined = " ".join(parts).upper()
     disc_token = None
-    if "EBC II" in joined:
-        disc_token = "EBC II"
-    elif re.search(r"\bIND\b", joined):
-        disc_token = "IND"
-    elif re.search(r"\bEBC\b", joined):
-        disc_token = "EBC"
+    if "EBC II" in joined: disc_token = "EBC II"
+    elif re.search(r"\bIND\b", joined): disc_token = "IND"
+    elif re.search(r"\bEBC\b", joined): disc_token = "EBC"
     docente = None
     if disc_token:
         pos = joined.find(disc_token)
         docente_raw = base[pos + len(disc_token):].strip()
         docente_raw = re.sub(r"\s+", " ", docente_raw).strip()
         docente = docente_raw if docente_raw else None
-    else:
-        tail = []
-        for p in parts[::-1]:
-            if re.fullmatch(r"[A-Z]{2}6", p.upper()):
-                break
-            if re.fullmatch(r"\d{6,}", p):
-                continue
-            tail.append(p)
-        if tail:
-            docente = " ".join(tail[::-1])
     disc_label = DISC_MAP.get(disc_token or "", None)
     return turma, disc_label, docente
 
@@ -308,8 +316,7 @@ def get_or_create_teacher(session, nome: str, email_guess: str = "") -> Teacher:
     if not email_norm and nome:
         slug = re.sub(r"[^a-z0-9]+", ".", (nome or "").lower()).strip(".")
         email_norm = f"{slug}@pucsp.edu.br"
-    if not email_norm:
-        email_norm = "docente@pucsp.edu.br"
+    if not email_norm: email_norm = "docente@pucsp.edu.br"
     t = session.query(Teacher).filter(Teacher.email == email_norm).first()
     if not t:
         t = Teacher(name=(nome or email_norm.split("@")[0].title()).strip(),
@@ -347,10 +354,8 @@ def import_students_df(session, df: pd.DataFrame, offering: Offering, is_industr
         name = str(row[c_name]).strip()
         ra   = str(row[c_ra]).strip()
         email = str(row[c_email]).strip().lower() if c_email else ""
-        if not name or not ra:
-            continue
-        if not email:
-            email = f"{ra}@pucsp.edu.br"
+        if not name or not ra: continue
+        if not email: email = f"{ra}@pucsp.edu.br"
         email = email.lower()
         stu = session.query(Student).filter_by(email=email).first()
         if not stu:
@@ -364,10 +369,8 @@ def import_students_df(session, df: pd.DataFrame, offering: Offering, is_industr
         else:
             stu.name = name
             if ra: stu.ra = ra
-            if is_industrial:
-                stu.industrial_class_id = offering.id
-            else:
-                stu.ebc_class_id = offering.id
+            if is_industrial: stu.industrial_class_id = offering.id
+            else:             stu.ebc_class_id = offering.id
             session.commit()
             updated += 1
     return created, updated
@@ -394,13 +397,14 @@ def make_themes_template() -> bytes:
 if st.session_state.user_role == 'student':
     tabs = st.tabs(["Grupos & Temas", "Upload"])
 else:
-    tabs = st.tabs(["Grupos & Temas", "Upload", "Avaliação", "Relatórios", "Admin (Students)", "Temas (Gestão)"])
+    tabs = st.tabs(["Grupos & Temas", "Upload", "Avaliação", "Relatórios", "Admin (Students)", "Temas (Gestão)", "Grupos (Admin)"])
 
 # ---------------------------
 # Tab 1 – Grupos & Temas
 # ---------------------------
 with tabs[0]:
-    st.header("Grupos & Temas (sem duplicidade de tema)")
+    st.header("Grupos & Temas (mín. 3 para reservar; máx. 5 — 6 com autorização)")
+
     if st.session_state.user_role == 'student':
         membership = session.query(GroupMember).filter_by(student_id=current_user.id).first()
         if membership:
@@ -417,6 +421,26 @@ with tabs[0]:
                 t = "/".join(tags) if tags else "–"
                 lines.append(f"- {stud.name} ({t})")
             st.markdown("\n".join(lines))
+
+            # Histórico de envios do grupo (com “quem enviou”)
+            st.markdown("**Submissões do Grupo:**")
+            subs = session.query(Submission).filter_by(group_id=grp.id).order_by(Submission.id.desc()).all()
+            if subs:
+                for s in subs:
+                    files = json.loads(s.files)
+                    who = files.get("_by","(sem identific.)")
+                    when = s.timestamp
+                    st.write(f"📄 Envio em {when} por **{who}**")
+                    for lbl, fn in files.items():
+                        if lbl in ("_meta","_by","termo","video_file"): 
+                            continue
+                        p = os.path.join("uploads", f"group_{grp.id}", when, fn)
+                        if os.path.exists(p):
+                            with open(p, "rb") as f:
+                                st.download_button(f"Baixar {lbl.capitalize()} ({fn})", data=f.read(), file_name=fn, key=f"stu_{s.id}_{lbl}")
+            else:
+                st.caption("_Sem envios._")
+
             st.info("Para enviar arquivos, acesse a aba **Upload**.")
         else:
             st.subheader("Entrar em um grupo existente")
@@ -424,16 +448,18 @@ with tabs[0]:
             joinables = []
             for g in groups:
                 n = len(g.members_assoc)
-                if n < 5:  # até 5 alunos (ajuste se quiser 6)
-                    joinables.append(f"{g.name} | {g.theme} ({n}/5)")
+                limit = 6 if bool(getattr(g, "allow_six", False)) else 5
+                if n < limit:
+                    joinables.append(f"{g.name} | {g.theme} ({n}/{limit})")
             if joinables:
                 choice = st.selectbox("Escolha um grupo para entrar:", [""] + joinables, index=0)
                 if choice:
                     gname = choice.split(" | ")[0]
                     grp = session.query(Group).filter_by(name=gname).first()
                     if grp:
-                        if len(grp.members_assoc) >= 5:
-                            st.error("Grupo já atingiu o limite de 5 integrantes.")
+                        limit = 6 if bool(getattr(grp, "allow_six", False)) else 5
+                        if len(grp.members_assoc) >= limit:
+                            st.error(f"Grupo já atingiu o limite de {limit} integrantes.")
                         else:
                             session.add(GroupMember(group_id=grp.id, student_id=current_user.id))
                             session.commit()
@@ -444,7 +470,6 @@ with tabs[0]:
 
             st.markdown("---")
             st.subheader("Criar novo grupo")
-            # lista de temas ativos (opcional)
             theme_records = session.query(Theme).filter(Theme.active == True).order_by(Theme.title.asc()).all()
             use_catalog = st.checkbox("Escolher tema do catálogo", value=True)
             new_theme = None
@@ -479,7 +504,8 @@ with tabs[0]:
             st.write("_Nenhum grupo ainda._")
         for g in groups:
             names = ", ".join([gm.student.name for gm in g.members_assoc]) or "–"
-            st.write(f"- **{g.name}** – Tema: *{g.theme}* – Integrantes: {names}")
+            limit = 6 if bool(getattr(g, "allow_six", False)) else 5
+            st.write(f"- **{g.name}** – Tema: *{g.theme}* – Integrantes: {names} (máx {limit})")
 
 # ---------------------------
 # Tab 2 – Upload (Aluno)
@@ -496,6 +522,7 @@ with tabs[1]:
             grp = session.query(Group).get(membership.group_id)
             st.subheader(f"{grp.name} — {grp.theme}")
 
+            # Turmas do aluno
             ind_off = current_user.industrial_class
             ebc_off = current_user.ebc_class
             disc_choices = []
@@ -514,32 +541,54 @@ with tabs[1]:
             turma_default = disc_off.name if disc_off else (ind_off.name if ind_off else (ebc_off.name if ebc_off else ""))
             turma_entrega = st.text_input("Turma da entrega (ex.: MA6, MB6, NA6, NB6)", value=turma_default)
 
-            terms  = st.file_uploader("Termo de Cessão (docx/pdf) **obrigatório**", type=["docx", "pdf"])
+            # Termo de cessão como CHECKBOX (sem arquivo)
+            consent = st.checkbox("Cedo os direitos patrimoniais à PUC‑SP para divulgação acadêmica/extensionista, com crédito aos autores.", value=False)
+
+            # Link de vídeo (obrigatório)
+            video_url = st.text_input("Link do vídeo (YouTube/Stream/Drive) **obrigatório**").strip()
+
+            # Arquivos obrigatórios (relatório/slides). Vídeo‑arquivo é opcional (preferir link)
             report = st.file_uploader("Relatório (pdf/docx) **obrigatório**", type=["pdf", "docx"])
             slides = st.file_uploader("Slides (pptx/pdf) **obrigatório**", type=["pptx", "pdf"])
-            video  = st.file_uploader("Vídeo (mp4/mov/mkv/avi/mpeg) **obrigatório**", type=["mp4","mov","mkv","avi","mpeg"])
+            video_file  = st.file_uploader("Vídeo (mp4/mov/mkv/avi/mpeg) – **opcional** (prefira link)", type=["mp4","mov","mkv","avi","mpeg"])
 
             if st.button("Enviar"):
-                if not all([terms, report, slides, video]):
-                    st.error("Envie todos os arquivos obrigatórios.")
+                if not all([consent, report, slides, video_url]):
+                    st.error("Marque o **termo**, anexe **relatório** + **slides** e informe o **link do vídeo**.")
                 elif not turma_entrega.strip():
                     st.error("Informe a turma da entrega.")
                 else:
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     base_dir = os.path.join("uploads", f"group_{grp.id}", timestamp)
                     os.makedirs(base_dir, exist_ok=True)
-                    files = [("termo", terms), ("relatorio", report), ("slides", slides), ("video", video)]
+                    files = []
                     saved = {}
-                    for label, up in files:
+
+                    # salva local: relatório e slides
+                    for label, up in [("relatorio", report), ("slides", slides)]:
                         path = os.path.join(base_dir, up.name)
                         with open(path, "wb") as f:
                             f.write(up.getbuffer())
                         saved[label] = up.name
+                        files.append((label, up.name))
+
+                    # salva vídeo-ARQUIVO se enviado (opcional)
+                    if video_file:
+                        path = os.path.join(base_dir, video_file.name)
+                        with open(path, "wb") as f:
+                            f.write(video_file.getbuffer())
+                        saved["video_file"] = video_file.name
+                        files.append(("video_file", video_file.name))
+
+                    # Metadados (_meta) e consentimento (_by)
                     saved["_meta"] = {
                         "disciplina": disc_label,
                         "disciplina_code": disc_code,
-                        "turma": turma_entrega.strip()
+                        "turma": turma_entrega.strip(),
+                        "video_url": video_url
                     }
+                    saved["termo"] = 1
+                    saved["_by"] = current_user.email
 
                     # SharePoint (opcional)
                     sp_client_id     = st.secrets.get("sp_client_id")
@@ -564,10 +613,11 @@ with tabs[1]:
                             st.error(f"Auth SharePoint falhou: {e}")
 
                     if token and sp_drive_id:
-                        for label, up in files:
-                            local_path = os.path.join(base_dir, up.name)
+                        # envia cada arquivo salvo localmente (relatório/slides e, se houver, vídeo_arquivo)
+                        for label, fname in files:
+                            local_path = os.path.join(base_dir, fname)
                             try:
-                                enc = urllib.parse.quote(up.name)
+                                enc = urllib.parse.quote(fname)
                                 url = f"https://graph.microsoft.com/v1.0/drives/{sp_drive_id}/root:{sp_folder_path}/{enc}:/createUploadSession"
                                 h = {"Authorization": f"Bearer {token}"}
                                 s = requests.post(url, headers=h, timeout=30)
@@ -589,18 +639,19 @@ with tabs[1]:
                                             raise Exception(f"Upload falhou: {put.status_code} {put.text}")
                                         sent += len(data)
                             except Exception as e:
-                                st.error(f"SharePoint falhou para {up.name}: {e}")
+                                st.error(f"SharePoint falhou para {fname}: {e}")
 
                     sub = Submission(group_id=grp.id, timestamp=timestamp, files=json.dumps(saved, ensure_ascii=False))
                     session.add(sub); session.commit()
                     st.success("Submissão registrada. Arquivos salvos localmente e (se configurado) no SharePoint.")
+                    st.rerun()
 
 # ---------------------------
 # Tab 3 – Avaliação (Docente)
 # ---------------------------
 if st.session_state.user_role == 'teacher':
     with tabs[2]:
-        st.header("Avaliação de Grupos")
+        st.header(f"Avaliações de {current_user.name}")
         teacher_offs = current_user.offerings
         all_groups = session.query(Group).all()
         is_admin = (getattr(current_user, "email", "").lower() == ADMIN_EMAIL.lower())
@@ -615,28 +666,25 @@ if st.session_state.user_role == 'teacher':
             discs = list({o.discipline.name for o in teacher_offs})
             sel_disc = st.selectbox("Disciplina", ["Todas"] + discs)
 
+        # aplica filtros (docente vê todos; filtros só para navegação)
         filtered = []
         for g in all_groups:
             ok = True
             if sel_class != "Todas":
-                has = False
-                for gm in g.members_assoc:
-                    stud = gm.student
-                    if (stud.industrial_class and stud.industrial_class.name == sel_class) or \
-                       (stud.ebc_class and stud.ebc_class.name == sel_class):
-                        has = True; break
+                has = any(
+                    (gm.student.industrial_class and gm.student.industrial_class.name == sel_class) or
+                    (gm.student.ebc_class and gm.student.ebc_class.name == sel_class)
+                    for gm in g.members_assoc
+                )
                 ok = has
             if ok and sel_disc != "Todas":
-                hasd = False
-                for gm in g.members_assoc:
-                    stud = gm.student
-                    if sel_disc.startswith("Economia Industrial") and stud.industrial_class_id:
-                        hasd = True; break
-                    if sel_disc.startswith("Economia Brasileira") and stud.ebc_class_id:
-                        hasd = True; break
+                hasd = any(
+                    (sel_disc.startswith("Economia Industrial") and gm.student.industrial_class_id) or
+                    (sel_disc.startswith("Economia Brasileira") and gm.student.ebc_class_id)
+                    for gm in g.members_assoc
+                )
                 ok = hasd
             if ok: filtered.append(g)
-
         filtered = sorted({g for g in filtered}, key=lambda x: x.name)
 
         if not filtered:
@@ -647,27 +695,22 @@ if st.session_state.user_role == 'teacher':
             if gsel:
                 grp = session.query(Group).filter_by(name=gsel).first()
                 st.subheader(f"{grp.name} — {grp.theme}")
+                names = ", ".join(sorted([gm.student.name for gm in grp.members_assoc]))
+                st.caption(f"Integrantes: {names if names else '—'}")
 
-                st.markdown("**Integrantes:**")
-                for gm in grp.members_assoc:
-                    stud = gm.student
-                    tags = []
-                    if stud.industrial_class_id: tags.append("IND")
-                    if stud.ebc_class_id: tags.append("EBC")
-                    t = "/".join(tags) if tags else "–"
-                    st.write(f"- {stud.name} ({t})")
-
+                # histórico
                 subs = session.query(Submission).filter_by(group_id=grp.id).order_by(Submission.id.desc()).all()
                 if subs:
                     st.markdown("**Histórico de envios:**")
                     for s in subs:
-                        when = s.timestamp
                         files = json.loads(s.files)
-                        st.write(f"📄 {when} — {files.get('_meta', {})}")
+                        meta = files.get("_meta", {})
+                        who = files.get("_by","(sem identific.)")
+                        st.write(f"📄 {s.timestamp} — {meta} — por **{who}**")
                         for lbl, fn in files.items():
-                            if lbl == "_meta": continue
-                            path = os.path.join("uploads", f"group_{grp.id}", when, fn)
-                            nice = {"termo":"Termo", "relatorio":"Relatório", "slides":"Slides", "video":"Vídeo"}.get(lbl,lbl)
+                            if lbl in ("_meta","_by","termo"): continue
+                            path = os.path.join("uploads", f"group_{grp.id}", s.timestamp, fn)
+                            nice = {"relatorio":"Relatório", "slides":"Slides", "video_file":"Vídeo (arquivo)"}.get(lbl,lbl)
                             if os.path.exists(path):
                                 with open(path, "rb") as f:
                                     data = f.read()
@@ -680,6 +723,12 @@ if st.session_state.user_role == 'teacher':
                                     st.download_button(f"Baixar {nice} ({fn})", data=data, file_name=fn, key=f"d_{s.id}_{lbl}")
                             else:
                                 st.write(f"- {fn} (não encontrado localmente)")
+                    # Link de vídeo
+                    vurl = json.loads(subs[0].files).get("_meta", {}).get("video_url","")
+                    if vurl:
+                        st.write(f"🎬 Vídeo: {vurl}")
+                        if "youtube.com" in vurl or "youtu.be" in vurl:
+                            st.video(vurl)
                 else:
                     st.write("_Sem envios._")
 
@@ -725,7 +774,7 @@ if st.session_state.user_role == 'teacher':
 # ---------------------------
 if st.session_state.user_role == 'teacher':
     with tabs[3]:
-        st.header("Relatórios (PDF)")
+        st.header("Relatórios (PDF + Listagens)")
         if FPDF is None:
             st.error("A biblioteca fpdf2 não está instalada. Adicione 'fpdf2' ao requirements.txt para habilitar PDFs.")
         else:
@@ -740,8 +789,7 @@ if st.session_state.user_role == 'teacher':
             is_admin = (getattr(current_user, "email", "").lower() == ADMIN_EMAIL.lower())
 
             def pdf_bytes_for_group(grp: Group):
-                pdf = FPDF()
-                pdf.add_page()
+                pdf = FPDF(); pdf.add_page()
                 pdf.set_font("Arial", 'B', 14)
                 pdf.cell(0, 10, f"Grupo {grp.name}", ln=True, align="C")
                 pdf.set_font("Arial", '', 12)
@@ -784,6 +832,7 @@ if st.session_state.user_role == 'teacher':
                         if has: keep.append(g)
                     groups = keep
                 buf = BytesIO()
+                import zipfile
                 with zipfile.ZipFile(buf, "w") as z:
                     for g in groups:
                         z.writestr(f"{g.name.replace(' ','_')}.pdf", pdf_bytes_for_group(g))
@@ -795,6 +844,7 @@ if st.session_state.user_role == 'teacher':
                     t_off_ids = {o.id for o in current_user.offerings}
                     students = [s for s in students if (s.industrial_class_id in t_off_ids) or (s.ebc_class_id in t_off_ids)]
                 buf = BytesIO()
+                import zipfile
                 with zipfile.ZipFile(buf, "w") as z:
                     for s in students:
                         pdf = FPDF(); pdf.add_page()
@@ -844,6 +894,31 @@ if st.session_state.user_role == 'teacher':
                 st.download_button("Baixar PDF (Resumo)", data=pdf.output(dest="S").encode("latin-1"),
                                    file_name=f"Resumo_{current_user.name.replace(' ','_')}.pdf")
 
+        st.markdown("---")
+        st.subheader("Listagens úteis (IND/EBC)")
+        # 1) só IND, 2) só EBC, 3) ambas, 4) IND e EBC em turmas diferentes
+        students = session.query(Student).all()
+        only_ind = [s for s in students if s.industrial_class_id and not s.ebc_class_id]
+        only_ebc = [s for s in students if s.ebc_class_id and not s.industrial_class_id]
+        both = [s for s in students if s.industrial_class_id and s.ebc_class_id]
+        diff = [s for s in both if (s.industrial_class.name != s.ebc_class.name)]
+        def tbl(title, lst):
+            st.markdown(f"**{title}** ({len(lst)})")
+            if not lst: st.caption("—")
+            else:
+                rows = []
+                for s in lst:
+                    rows.append({
+                        "Aluno": s.name, "E-mail": s.email, "RA": s.ra or "-",
+                        "IND": s.industrial_class.name if s.industrial_class else "-",
+                        "EBC": s.ebc_class.name if s.ebc_class else "-"
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        tbl("Somente IND", only_ind)
+        tbl("Somente EBC II", only_ebc)
+        tbl("Em ambas (IND + EBC II)", both)
+        tbl("Em IND e EBC II em turmas diferentes", diff)
+
 # ---------------------------
 # Tab 5 – Admin (Students)
 # ---------------------------
@@ -856,10 +931,7 @@ if st.session_state.user_role == 'teacher':
             "Selecione abaixo a **Disciplina** e a **Turma** que este arquivo representa."
         )
 
-        disc_label_to_obj = {
-            "Economia Industrial": disc_ind,
-            "Economia Brasileira Contemporânea II": disc_ebc,
-        }
+        disc_label_to_obj = {"Economia Industrial": disc_ind, "Economia Brasileira Contemporânea II": disc_ebc}
         sel_disc_label = st.selectbox("Disciplina deste CSV/XLSX", list(disc_label_to_obj.keys()))
         sel_disc = disc_label_to_obj[sel_disc_label]
         sel_turma = st.text_input("Turma (ex.: MA6, MB6, NA6, NB6)")
@@ -892,8 +964,7 @@ if st.session_state.user_role == 'teacher':
                         name = str(row[c_name]).strip()
                         ra   = str(row[c_ra]).strip()
                         email_raw = (str(row[c_email]).strip().lower() if c_email else "")
-                        if not name or not ra:
-                            continue
+                        if not name or not ra: continue
                         email = (email_raw if email_raw else f"{ra}@pucsp.edu.br").lower()
                         stu = session.query(Student).filter_by(email=email).first()
                         if not stu:
@@ -917,9 +988,9 @@ if st.session_state.user_role == 'teacher':
         st.markdown("---")
         st.markdown("### Templates XLSX")
         colx1, colx2 = st.columns(2)
-        if colx1.download_button("Baixar template de ALUNOS (XLSX)", data=make_students_template(), file_name="template_alunos.xlsx"):
+        if colx1.download_button("Baixar template de ALUNOS (XLSX)", data=_xlsx_bytes_from_df(pd.DataFrame([{"name": "NOME", "ra": "RA123456", "email":"RA123456@pucsp.edu.br"}])), file_name="template_alunos.xlsx"):
             pass
-        if colx2.download_button("Baixar template de TEMAS (XLSX)", data=make_themes_template(), file_name="template_temas.xlsx"):
+        if colx2.download_button("Baixar template de TEMAS (XLSX)", data=_xlsx_bytes_from_df(pd.DataFrame([{"title":"Título do tema","category":"Categoria","active":True}])), file_name="template_temas.xlsx"):
             pass
 
         st.markdown("---")
@@ -952,8 +1023,7 @@ if st.session_state.user_role == 'teacher':
                             name = str(row[c_name]).strip()
                             ra   = str(row[c_ra]).strip()
                             email_raw = (str(row[c_email]).strip().lower() if c_email else "")
-                            if not name or not ra:
-                                continue
+                            if not name or not ra: continue
                             email = (email_raw if email_raw else f"{ra}@pucsp.edu.br").lower()
                             stu = session.query(Student).filter_by(email=email).first()
                             if not stu:
@@ -1016,14 +1086,8 @@ if st.session_state.user_role == 'teacher':
             offs_ebc = session.query(Offering).filter_by(discipline_id=disc_ebc.id).all()
             opt_ind = ["(sem)"] + [o.name for o in offs_ind]
             opt_ebc = ["(sem)"] + [o.name for o in offs_ebc]
-            idx_ind = 0
-            if stu.industrial_class: 
-                try: idx_ind = opt_ind.index(stu.industrial_class.name)
-                except: idx_ind = 0
-            idx_ebc = 0
-            if stu.ebc_class:
-                try: idx_ebc = opt_ebc.index(stu.ebc_class.name)
-                except: idx_ebc = 0
+            idx_ind = opt_ind.index(stu.industrial_class.name) if stu.industrial_class and stu.industrial_class.name in opt_ind else 0
+            idx_ebc = opt_ebc.index(stu.ebc_class.name) if stu.ebc_class and stu.ebc_class.name in opt_ebc else 0
             sel_ind = st.selectbox("Turma IND", opt_ind, index = idx_ind)
             sel_ebc = st.selectbox("Turma EBC II", opt_ebc, index = idx_ebc)
             if st.button("Salvar aluno"):
@@ -1048,7 +1112,6 @@ if st.session_state.user_role == 'teacher':
 if st.session_state.user_role == 'teacher':
     with tabs[5]:
         st.header("Gestão de Temas")
-        st.caption("Catálogo de temas (sem duplicidade). Recomenda-se que grupos usem a lista ativa.")
         up_themes = st.file_uploader("Importar TEMAS (XLSX) — colunas: title, category, active", type=["xlsx"])
         if up_themes and st.button("Processar XLSX de TEMAS"):
             try:
@@ -1103,5 +1166,28 @@ if st.session_state.user_role == 'teacher':
                         session.delete(t); session.commit()
                         st.warning("Tema excluído.")
                         st.rerun()
+
+# ---------------------------
+# Tab 7 – Grupos (Admin)
+# ---------------------------
+if st.session_state.user_role == 'teacher':
+    with tabs[6]:
+        st.header("Admin – Grupos (Permitir 6 / Publicação)")
+        groups = session.query(Group).order_by(Group.name.asc()).all()
+        for g in groups:
+            with st.expander(f"{g.name} — {g.theme}"):
+                col1, col2, col3 = st.columns([1,1,2])
+                allow6 = col1.checkbox("Permitir 6 alunos", value=bool(getattr(g, "allow_six", False)), key=f"allow6_{g.id}")
+                publish = col2.checkbox("Publicar na galeria", value=bool(getattr(g, "publish_public", False)), key=f"pub_{g.id}")
+                # checa tamanho atual x limite
+                n = len(g.members_assoc)
+                limit = 6 if allow6 else 5
+                col3.caption(f"Integrantes: {n} / {limit} (mín. para reservar: 3)")
+                if col3.button("Salvar", key=f"savegrp_{g.id}"):
+                    g.allow_six = bool(allow6)
+                    g.publish_public = bool(publish)
+                    session.commit()
+                    st.success("Atualizado.")
+                    st.rerun()
 
 st.caption("MVP – Submissões Industrial & EBC II (2025/2)")
